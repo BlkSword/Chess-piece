@@ -7,3 +7,7 @@ edition = "2021"
 rand = "0.8"
 aes-gcm = { version = "0.10", features = ["aes"] }
 zstd = "0.13"
+
+[lib]
+name = "packer"
+path = "src/lib.rs"

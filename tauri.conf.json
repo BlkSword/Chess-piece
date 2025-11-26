@@ -1,0 +1,17 @@
+{
+  "build": {
+    "distDir": "../ui",
+    "withGlobalTauri": true
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Chess-piece 加壳器",
+        "width": 720,
+        "height": 520,
+        "resizable": true
+      }
+    ]
+  }
+}
+

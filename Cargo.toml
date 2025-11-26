@@ -3,6 +3,7 @@ members = [
     "crates/anti",
     "crates/stub",
     "crates/packer",
+    "crates/gui",
+    "src-tauri",
 ]
 resolver = "2"
-
