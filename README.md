@@ -1,4 +1,4 @@
-# Chess-piece：Shellcode打包器
+# Chess-piece：shellcode Packer
 
 Chess-piece 是一款为安全专业人员设计的精密shellcode打包工具。它将原始shellcode转换为一个隐蔽且具备规避能力的加载器（loader），配备了多层加密、混淆和先进的加载技术，旨在绕过现代安全解决方案。
 
