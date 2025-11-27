@@ -1,7 +1,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use windows_sys::Win32::Foundation::BOOL;
-use windows_sys::Win32::System::Diagnostics::Debug::{CheckRemoteDebuggerPresent, IsDebuggerPresent};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CheckRemoteDebuggerPresent, IsDebuggerPresent,
+};
+use windows_sys::Win32::System::SystemInformation::{
+    GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// Aggregated anti-debug checks.
@@ -24,52 +29,51 @@ pub fn has_remote_debugger() -> bool {
 
 /// Aggregated anti-VM checks.
 pub fn anti_vm_triggered() -> bool {
-    let bios = std::env::var("RS_PACK_VM_BIOS").ok().as_deref() == Some("1");
-    if bios {
-        hypervisor_present() || bios_vendor_indicates_vm()
+    let up_ms = uptime_ms();
+    let total_phys = total_physical_memory();
+    let tmp_count = temp_file_count();
+
+    let min_up_ms = std::env::var("RS_PACK_MIN_UPTIME_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(5 * 60 * 1000);
+    let min_phys = std::env::var("RS_PACK_MIN_PHYS_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(4 * 1024 * 1024 * 1024);
+    let min_tmp = std::env::var("RS_PACK_MIN_TEMPFILES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(30);
+
+    let conds = [
+        up_ms < min_up_ms,
+        total_phys < min_phys,
+        tmp_count < min_tmp,
+    ];
+    conds.iter().filter(|&&b| b).count() >= 2
+}
+
+pub fn uptime_ms() -> u64 {
+    unsafe { GetTickCount64() as u64 }
+}
+
+pub fn total_physical_memory() -> u64 {
+    let mut s: MEMORYSTATUSEX = unsafe { core::mem::zeroed() };
+    s.dwLength = core::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut s as *mut MEMORYSTATUSEX) };
+    if ok != 0 {
+        s.ullTotalPhys
     } else {
-        hypervisor_present()
+        0
     }
 }
 
-pub fn hypervisor_present() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        use core::arch::x86_64::__cpuid;
-        // CPUID leaf 0x1: ECX bit 31 indicates hypervisor present
-        let r = unsafe { __cpuid(0x1) };
-        (r.ecx & (1 << 31)) != 0
+pub fn temp_file_count() -> usize {
+    let d = std::env::temp_dir();
+    match std::fs::read_dir(d) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).count(),
+        Err(_) => 0,
     }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        false
-    }
-}
-
-pub fn bios_vendor_indicates_vm() -> bool {
-    use winreg::enums::HKEY_LOCAL_MACHINE;
-    use winreg::RegKey;
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let path = "HARDWARE\\DESCRIPTION\\System";
-    if let Ok(key) = hklm.open_subkey(path) {
-        let candidates = [
-            "SystemBiosVersion",
-            "SystemBiosDate",
-            "VideoBiosVersion",
-            "SystemManufacturer",
-            "SystemProductName",
-        ];
-        for name in candidates {
-            if let Ok(val) = key.get_value::<String, _>(name) {
-                let v = val.to_ascii_lowercase();
-                let indicators = [
-                    "vmware", "virtualbox", "qemu", "hyper-v", "xen", "kvm", "parallels",
-                ];
-                if indicators.iter().any(|s| v.contains(s)) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }

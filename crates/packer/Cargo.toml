@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rand = "0.8"
 aes-gcm = { version = "0.10", features = ["aes"] }
 zstd = "0.13"
+clap = { version = "4.5.4", features = ["derive"] }
+uuid = { version = "1.8.0", features = ["v4"] }
+rand = "0.8.5"
 
 [lib]
 name = "packer"

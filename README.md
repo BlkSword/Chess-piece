@@ -1,36 +1,67 @@
-# Chess-piece 加壳器（CLI）
+# Chess-piece：Shellcode打包器
 
-## 构建
-- `cargo build -p packer -p stub --release`
+Chess-piece 是一款为安全专业人员设计的精密shellcode打包工具。它将原始shellcode转换为一个隐蔽且具备规避能力的加载器（loader），配备了多层加密、混淆和先进的加载技术，旨在绕过现代安全解决方案。
 
-## 用法（Windows）
-- 文件模式：
-  - `target\release\packer.exe <输入EXE路径> [--out <输出壳EXE>]`
-- 命令模式：
-  - `target\release\packer.exe --cmd <命令路径> [--out <输出壳EXE>]`
-- Shellcode 模式：
-  - `target\release\packer.exe --sc <shellcode.bin|.c|.py> [--out <输出壳EXE>] [--remote <进程路径>]`
-  - `.bin`：作为原始shellcode内存运行（使用直接系统调用）；`.py`：打包为内置脚本，运行 `pythonw -c <脚本>` 不落地；`.c`：编译为EXE后加壳（等价源码模式）
-- 源码模式（编译后加壳）：
-  - `target\release\packer.exe --src <源码文件> --lang <rust|c> [--out <输出壳EXE>]`
+## 功能特性
 
-当未指定 `--out` 时，默认输出为 `<输入文件名>_packed.exe`。
+- **多层加密**：可选择 `aes`、`rc4` 和 `xor` 等多种方式加密shellcode负载。
+- **熵值混淆**：采用 `uuid` 格式化来伪装shellcode，降低其熵值，以规避静态分析。
+- **高级加载技术**：支持多种内存加载方法，包括 `callback`、`fiber` 和 `earlybird`。
+- **间接系统调用**：通过直接发起系统调用来执行关键操作（如内存分配和保护），从而绕过用户态的EDR钩子。
+- **Unhooking**：可在运行时恢复 `ntdll.dll` 的代码段，以移除钩子。
+- **反沙箱**：内置检测机制，用于识别并规避沙箱环境。
+- **可定制加载器**：目前可生成C语言版本的加载器，并计划在未来支持更多语言。
 
-## 运行与控制
-- 壳 Stub 采用 Windows 子系统，双击不显示控制台窗口。
-- 内测跳过检测：`RS_PACK_SKIP_ANTI=1`
-- 启用 BIOS 注册表检测：`RS_PACK_VM_BIOS=1`
+## 使用方法
 
-## 特性概览
-- **核心防护**
-  - **加密与压缩**：采用 AES-256-GCM 高强度加密 payload，结合 Zstd 压缩算法减小体积。
-  - **反调试**：集成 `IsDebuggerPresent`、`CheckRemoteDebuggerPresent` 等多重检测机制。
-  - **反虚拟机**：默认检测 CPUID 超管位；支持可选的 BIOS/注册表指纹检测 (`RS_PACK_VM_BIOS=1`)。
+本打包器通过命令行界面进行控制。以下是所有可用选项：
 
-- **隐蔽执行 (Stealth)**
-  - **Direct Syscalls**：通过动态解析 SSN 直接调用内核服务，完全绕过用户态 API 监控 (EDR Hooks)。
-  - **Unhooking**：运行时自动重载 `ntdll.dll` 代码段，清除安全软件植入的 Inline Hooks。
-  - **多态加载 (Polyglot Loading)**：Shellcode 执行方式随机化，降低行为特征熵值：
-    - **Fiber**：利用纤程上下文切换执行。
-    - **Callback**：通过系统回调 (`EnumSystemLocalesA`) 隐蔽触发。
-    - **APC / EarlyBird**：利用异步过程调用队列注入。
+```
+packer.exe --input <路径> [选项]
+```
+
+**参数说明：**
+
+| 参数 | 缩写 | 描述 | 默认值 |
+|---|---|---|---|
+| `--input` | `-i` | 原始shellcode文件的路径。 | **必需** |
+| `--enc` | | Shellcode的加密方法。 | `aes` |
+| | | *可选值*: `aes`, `rc4`, `xor` | |
+| `--lang` | | 生成的加载器所使用的语言。 | `c` |
+| `--output` | `-o` | 输出的可执行文件名。 | `Program` |
+| `--key-length` | `-k` | 加密密钥的长度。 | `16` |
+| `--obf` | | 用于降低熵值的混淆技术。 | `uuid` |
+| `--framework` | `-f` | 目标架构。 | `x64` |
+| `--sandbox` | | 启用或禁用反沙箱检测。 | `true` |
+| `--unhook` | | 启用或禁用ntdll unhooking。 | `false` |
+| | | *注意*: 设置为 `false` 将启用间接系统调用。 | |
+| `--loading` | | Shellcode的加载技术。 | `callback` |
+| | | *可选值*: `callback`, `fiber`, `earlybird` | |
+| `--debug` | | 打印中间过程的详细信息，包括生成的源代码。 | `false` |
+
+**示例：**
+
+```bash
+# 使用RC4加密和fiber加载技术打包shellcode
+.\packer.exe -i shellcode.bin --enc rc4 --loading fiber -o packed_loader.exe
+```
+
+## 从源码构建
+
+要从源码构建此打包器，您需要安装Rust工具链。
+
+1.  **构建项目**：
+
+    ```bash
+    cargo build -p packer -p stub --release
+    ```
+
+2.  **运行打包器**：
+
+    生成的可执行文件将位于 `target/release` 目录下。
+
+    ```bash
+    cd target/release
+    .\packer.exe -i <你的-shellcode.bin>
+    ```
+
