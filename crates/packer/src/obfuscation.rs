@@ -14,7 +14,7 @@ pub fn obfuscate(shellcode: &[u8], method: &str) -> Result<Vec<u8>, String> {
             let uuid_strings: Vec<String> = padded_shellcode
                 .chunks_exact(16)
                 .map(|chunk| {
-                    let uuid = Uuid::from_slice(chunk).unwrap();
+                    let uuid = Uuid::from_bytes_le(chunk.try_into().unwrap());
                     format!("\"{}\"", uuid.to_string())
                 })
                 .collect();

