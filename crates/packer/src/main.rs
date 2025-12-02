@@ -16,11 +16,10 @@ const ASCII_ART: &str = r#"
  | |____| | | |  __/\__ \  __/  | |_) | \__ \  __/\__ \  
   \_____|_| |_|\___||___/\___|  |____/|_|___/\___||___/  
 
-           Chess-piece Advanced Shellcode Packer
 "#;
 
 #[derive(Parser, Debug)]
-#[command(author = "fdx_xdf", version = "2.0", about = ASCII_ART, long_about = None)]
+#[command(author = "Blksword", version = "2.0", about = ASCII_ART, long_about = None)]
 struct Args {
     #[arg(short, long)]
     input: Option<PathBuf>,
@@ -48,6 +47,12 @@ struct Args {
     debug: bool,
     #[arg(long)]
     cmd: Option<String>,
+    #[arg(
+        long,
+        default_value_t = true,
+        help = "Use Rust stub loader instead of C templates"
+    )]
+    use_stub: bool,
 }
 
 fn main() {
@@ -56,6 +61,63 @@ fn main() {
     println!("Starting the advanced shellcode packing process...");
     println!("Configuration:");
     println!("{:#?}", args);
+
+    if args.use_stub {
+        let out_path = PathBuf::from(format!("{}.exe", args.output));
+        if let Some(cmd) = args.cmd.as_ref() {
+            match packer::pack_cmd(cmd, &out_path) {
+                Ok(()) => {
+                    println!("Packed using Rust stub: {}", out_path.display());
+                }
+                Err(e) => {
+                    eprintln!("Failed to pack with Rust stub: {}", e);
+                }
+            }
+            return;
+        }
+        if let Some(input_path) = args.input.as_ref() {
+            let data = fs::read(input_path);
+            if let Ok(d) = data {
+                // Check for MZ header to identify PE file
+                let is_pe = d.len() >= 2 && d[0] == b'M' && d[1] == b'Z';
+                // Also consider .bin files as shellcode explicitly if they don't have MZ header
+                // But if the user provided a .bin file that happens to start with MZ (unlikely for shellcode but possible),
+                // we should treat it as shellcode if the extension is .bin
+                let is_bin_ext = input_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("bin"))
+                    .unwrap_or(false);
+
+                if is_pe && !is_bin_ext {
+                    match packer::pack_file(input_path, &out_path) {
+                        Ok(()) => {
+                            println!("Packed file using Rust stub: {}", out_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to pack with Rust stub: {}", e);
+                        }
+                    }
+                } else {
+                    // It's shellcode (either .bin file or no MZ header)
+                    match packer::pack_shellcode(input_path, &out_path, "local", None) {
+                        Ok(()) => {
+                            println!("Packed shellcode using Rust stub: {}", out_path.display());
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to pack shellcode with Rust stub: {}", e);
+                        }
+                    }
+                }
+                return;
+            } else {
+                eprintln!("Failed to read input file");
+                return;
+            }
+        }
+        eprintln!("When --use-stub is set, provide either --cmd or --input");
+        return;
+    }
 
     let shellcode = if let Some(cmd) = args.cmd.as_ref() {
         let mut bytes = cmd.as_bytes().to_vec();

