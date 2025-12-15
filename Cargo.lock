@@ -450,6 +450,7 @@ dependencies = [
  "aes-gcm",
  "lazy_static",
  "ntapi",
+ "rand",
  "windows-sys 0.52.0",
  "zstd",
 ]

