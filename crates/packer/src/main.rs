@@ -65,7 +65,7 @@ fn main() {
     if args.use_stub {
         let out_path = PathBuf::from(format!("{}.exe", args.output));
         if let Some(cmd) = args.cmd.as_ref() {
-            match packer::pack_cmd(cmd, &out_path) {
+            match packer::pack_cmd(cmd, &out_path, &args.obf) {
                 Ok(()) => {
                     println!("Packed using Rust stub: {}", out_path.display());
                 }
@@ -90,7 +90,7 @@ fn main() {
                     .unwrap_or(false);
 
                 if is_pe && !is_bin_ext {
-                    match packer::pack_file(input_path, &out_path) {
+                    match packer::pack_file(input_path, &out_path, &args.obf) {
                         Ok(()) => {
                             println!("Packed file using Rust stub: {}", out_path.display());
                         }
@@ -100,7 +100,7 @@ fn main() {
                     }
                 } else {
                     // It's shellcode (either .bin file or no MZ header)
-                    match packer::pack_shellcode(input_path, &out_path, "local", None) {
+                    match packer::pack_shellcode(input_path, &out_path, "local", None, &args.obf) {
                         Ok(()) => {
                             println!("Packed shellcode using Rust stub: {}", out_path.display());
                         }
