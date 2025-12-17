@@ -14,6 +14,7 @@
     -   **Command**: 支持嵌入 CMD 命令并隐蔽执行。
 -   **反分析**: 内置多态代码混淆与简单的反调试/反沙箱逻辑。
 -   **子系统切换**: 支持通过 `--debug` 参数灵活切换 GUI (无窗口) 与 Console (黑框) 模式。
+-   **数字签名伪造**: 支持从合法 PE 文件（如 `explorer.exe`）复制数字签名块，欺骗部分静态检测与人工分析。
 
 ###  Legacy C Templates (可选)
 保留了基于 C 语言模板的生成方式，适合需要高度定制底层技术的场景：
@@ -96,6 +97,7 @@ packer.exe --input shellcode.bin --output payload_debug --debug
     -   读取预编译的 `stub.exe`。
     -   根据 `--debug` 参数修改 Stub 的 PE Subsystem (GUI/Console)。
     -   将加密后的 Payload、密钥、Nonce 追加到 Stub 尾部。
+    -   **签名伪造** (若启用): 提取指定文件的 Security Directory (证书表) 并追加到文件末尾，同时修正 PE 头指针。
 3.  **运行时行为**:
     -   Stub 启动后通过多态代码干扰静态分析。
     -   解析自身读取 Payload 并解密。
