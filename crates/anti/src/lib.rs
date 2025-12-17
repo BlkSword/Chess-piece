@@ -36,8 +36,6 @@ pub fn anti_vm_triggered() -> bool {
     let total_phys = total_physical_memory();
     let tmp_count = temp_file_count();
     let proc_count = process_count();
-    let wechat_installed = is_wechat_installed();
-
     let min_up_ms = std::env::var("RS_PACK_MIN_UPTIME_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -61,7 +59,6 @@ pub fn anti_vm_triggered() -> bool {
         total_phys < min_phys,
         tmp_count < min_tmp,
         proc_count < min_procs,
-        !wechat_installed,
     ];
     conds.iter().filter(|&&b| b).count() >= 2
 }

