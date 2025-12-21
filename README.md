@@ -83,6 +83,7 @@ packer.exe --input shellcode.bin --output payload_debug --debug
 | `--enc` | | (Legacy) 加密算法: `aes`, `rc4`, `xor`。 | `aes` |
 | `--loading` | | (Legacy) 加密载荷加载方式: `callback`, `fiber`, `earlybird`。 | `callback` |
 | `--unhook` | | (Legacy) 启用常规 WinAPI (设为 false 则尝试间接系统调用)。 | `true` |
+| `--sign` | | 数字签名伪造，指定一个带有合法数字签名的源文件。 | `C:\Windows\System32\explorer.exe` |
 
 ---
 

