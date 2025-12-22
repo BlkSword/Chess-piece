@@ -26,6 +26,7 @@ fn main() {
 
     // 2. Randomize Version Info
     println!("cargo:rerun-if-env-changed=BUILD_RANDOM_NONCE");
+    println!("cargo:rustc-link-arg=/GUARD:NO"); // Disable CFG
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
         let companies = [
             "Universal Driver Solutions",

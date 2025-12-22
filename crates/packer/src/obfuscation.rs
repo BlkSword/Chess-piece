@@ -1,4 +1,3 @@
-
 use uuid::Uuid;
 
 pub fn obfuscate(shellcode: &[u8], method: &str) -> Result<Vec<u8>, String> {
@@ -51,6 +50,18 @@ pub fn obfuscate(shellcode: &[u8], method: &str) -> Result<Vec<u8>, String> {
                     }
                     s
                 })
+                .collect();
+            Ok(strings.join("\n").into_bytes())
+        }
+        "ipv4" => {
+            let mut padded = shellcode.to_vec();
+            let rem = padded.len() % 4;
+            if rem != 0 {
+                padded.extend(vec![0x00; 4 - rem]);
+            }
+            let strings: Vec<String> = padded
+                .chunks_exact(4)
+                .map(|c| format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3]))
                 .collect();
             Ok(strings.join("\n").into_bytes())
         }

