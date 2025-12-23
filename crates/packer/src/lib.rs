@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod obfuscation;
 
-const MARKER: &[u8] = b"2048KB\0";
+const MARKER: &[u8] = b"r7stP4ck";
 
 fn read_stub(default_release_first: bool) -> Result<Vec<u8>, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();

@@ -18,7 +18,16 @@ pub fn anti_debug_triggered() -> bool {
 }
 
 pub fn is_debugger_present() -> bool {
-    unsafe { IsDebuggerPresent() != 0 }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let peb: *const u8;
+        core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+        *peb.add(2) != 0
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        IsDebuggerPresent() != 0
+    }
 }
 
 pub fn has_remote_debugger() -> bool {

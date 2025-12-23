@@ -25,7 +25,7 @@ fn rc4_crypt(data: &[u8], key: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn encrypt(data: &[u8], method: &str, key_length: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub fn encrypt(data: &[u8], method: &str, key_length: u32) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     match method {
         "aes" => {
             if key_length != 32 {
@@ -36,19 +36,21 @@ pub fn encrypt(data: &[u8], method: &str, key_length: u32) -> Result<(Vec<u8>, V
             thread_rng().fill_bytes(&mut key);
 
             let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
-            let nonce = Nonce::from_slice(b"uniquestring"); // 12-byte nonce
+            let mut nonce_bytes = [0u8; 12];
+            thread_rng().fill_bytes(&mut nonce_bytes);
+            let nonce = Nonce::from_slice(&nonce_bytes);
 
             let ciphertext = cipher
                 .encrypt(nonce, data.as_ref())
                 .map_err(|e| e.to_string())?;
 
-            Ok((ciphertext, key))
+            Ok((ciphertext, key, nonce_bytes.to_vec()))
         }
         "rc4" => {
             let mut key = vec![0u8; key_length as usize];
             thread_rng().fill_bytes(&mut key);
             let ciphertext = rc4_crypt(data, &key);
-            Ok((ciphertext, key))
+            Ok((ciphertext, key, vec![]))
         }
         "xor" => {
             let mut key = vec![0u8; key_length as usize];
@@ -59,9 +61,9 @@ pub fn encrypt(data: &[u8], method: &str, key_length: u32) -> Result<(Vec<u8>, V
                 ciphertext.push(byte ^ key[i % key.len()]);
             }
 
-            Ok((ciphertext, key))
+            Ok((ciphertext, key, vec![]))
         }
-        "none" => Ok((data.to_vec(), vec![])),
+        "none" => Ok((data.to_vec(), vec![], vec![])),
         _ => Err(format!("Unsupported encryption method: {}", method)),
     }
 }

@@ -153,9 +153,9 @@ fn main() {
         }
     };
 
-    let (encrypted_shellcode_raw, key) =
+    let (encrypted_shellcode_raw, key, nonce) =
         match encryption::encrypt(&shellcode, &args.enc, args.key_length) {
-            Ok((enc_sc, key)) => (enc_sc, key),
+            Ok((enc_sc, key, nonce)) => (enc_sc, key, nonce),
             Err(e) => {
                 eprintln!("Failed to encrypt shellcode: {}", e);
                 return;
@@ -179,6 +179,7 @@ fn main() {
         &args.lang,
         &obfuscated_shellcode,
         &key,
+        &nonce,
         &args.loading,
         &args.obf,
         args.unhook,
